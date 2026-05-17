@@ -1,4 +1,5 @@
 # AI 视频生成工作空间
+<!-- mode: narration -->
 
 ---
 
@@ -8,11 +9,9 @@
 
 ### 视频规格
 - **视频比例**：由项目 `aspect_ratio` 配置决定，无需在 prompt 中指定
-  - 说书+画面模式默认：**9:16 竖屏**
-  - 剧集动画模式默认：16:9 横屏
 - **单片段/场景时长**：由视频模型能力和项目 `default_duration` 配置决定
-  - 说书+画面 / 剧集动画模式（storyboard / grid）：由项目 `default_duration` 决定（项目创建时按 content_mode 写入 project.json）
-  - 参考生视频模式（reference_video）：由所选视频模型的 `supported_durations` 决定；subagent 运行时通过 `mcp__arcreel__get_video_capabilities` 工具自查真值
+  - storyboard / grid 模式：由项目 `default_duration` 决定
+  - reference_video 模式：由所选视频模型的 `supported_durations` 决定；subagent 运行时通过 `mcp__arcreel__get_video_capabilities` 工具自查真值
 - **图片分辨率**：1K
 - **视频分辨率**：1080p
 - **生成方式**：每个片段/场景独立生成，使用分镜图作为起始帧
@@ -33,9 +32,9 @@
 
 ## 内容模式
 
-系统支持两种内容模式（说书+画面 / 剧集动画），通过 `project.json` 的 `content_mode` 字段切换。
+本项目为**说书+画面模式**（narration）。剧本数据结构为 `segments[]`，每个片段对应一段朗读 + 一张分镜画面。
 
-> 详细规格（画面比例、时长、数据结构、预处理 Agent 等）见 `.claude/references/generation-modes.md`。
+> 生成模式（storyboard / grid / reference_video）通过 `project.json` 的 `generation_mode` 字段配置，与内容模式独立。详细规格见 `.claude/references/generation-modes.md`。
 
 ---
 
@@ -116,7 +115,7 @@
 
 `/manga-workflow` 编排 skill 按以下阶段自动推进（每个阶段完成后等待用户确认）：
 
-1. **项目设置**：创建项目、选择 `content_mode` + `generation_mode`、上传小说、生成项目概述
+1. **项目设置**：创建项目（创建时确定 `content_mode`，之后不可变）、选择 `generation_mode`、上传小说、生成项目概述
 2. **全局角色/场景/道具提取** → dispatch `analyze-assets` subagent
 3. **分集规划** → 主 agent 直接执行 peek+split 切分（manage-project 工具集）
 4. **单集预处理** → 按 `effective_mode` 选：
