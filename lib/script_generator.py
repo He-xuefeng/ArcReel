@@ -7,6 +7,7 @@ script_generator.py - 剧本生成器
 import json
 import logging
 import re
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
@@ -35,6 +36,7 @@ from lib.script_models import (
 )
 from lib.text_backends.base import TextGenerationRequest, TextTaskType
 from lib.text_generator import TextGenerator
+from lib.text_metrics import count_reading_units
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,7 @@ _EID_PREFIX_RE = re.compile(r"^E\d+(?=[SU])")
 _QUALITY_PROBE_SCENE_MIN_LEN = 40
 _QUALITY_PROBE_ACTION_MIN_LEN = 25
 _QUALITY_PROBE_SHOT_TEXT_MIN_LEN = 15
+_NOVEL_TEXT_DRIFT_THRESHOLD = 0.10
 
 
 def _rewrite_episode_prefix(rid: object, ep: int) -> object:
@@ -550,5 +553,35 @@ class ScriptGenerator:
                     episode,
                     sorted(set(short_ids)),
                 )
+
+            # narration 模式 novel_text 漂移观察:LLM 应原文回填,但实测有偷偷扩写。
+            # 仅 WARN,不阻断/不重试/不推前端,符合「LLM 出错少数情况轻量不阻塞」原则。
+            if self.content_mode == "narration" and gen_mode != "reference_video":
+                source_path = self.project_path / "source" / f"episode_{episode}.txt"
+                if source_path.is_file():
+                    source_lang = self.project_json.get("source_language", "zh")
+                    # NFC normalize 边界:LLM 输出几乎必然 NFC,源若为 NFD(越南语 macOS
+                    # 文件名等罕见场景)会让 \w word boundary 把组合重音拆词,导致 expected
+                    # 偏大触发 false drift。统一 NFC 后比较 fair。
+                    source_text = unicodedata.normalize("NFC", source_path.read_text(encoding="utf-8"))
+                    expected = count_reading_units(source_text, source_lang)
+                    actual = sum(
+                        count_reading_units(
+                            unicodedata.normalize("NFC", str(seg.get("novel_text") or "")),
+                            source_lang,
+                        )
+                        for seg in script_data.get("segments") or []
+                        if isinstance(seg, dict)
+                    )
+                    if expected > 0:
+                        delta_ratio = abs(actual - expected) / expected
+                        if delta_ratio > _NOVEL_TEXT_DRIFT_THRESHOLD:
+                            logger.warning(
+                                "episode %d novel_text drift: expected=%d actual=%d delta=%.1f%%",
+                                episode,
+                                expected,
+                                actual,
+                                delta_ratio * 100,
+                            )
         except Exception as exc:
             logger.warning("episode %d quality probe skipped due to unexpected data shape: %s", episode, exc)
