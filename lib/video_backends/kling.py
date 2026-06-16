@@ -141,6 +141,19 @@ _KLING_VIDEO_CAPS: dict[str, _KlingVideoModelCaps] = {
     ),
 }
 
+
+def _lookup_video_caps(model: str) -> _KlingVideoModelCaps:
+    """按 model 取能力位：剥厂商前缀后 + 去首尾空白 + lower 归一化，再做【精确】命中 _KLING_VIDEO_CAPS。
+    中转前缀分隔符仅认仓库既有约定 ``/``（``vendor/kling-v3-omni``）与 ``:``（``provider:kling-v3-omni``）
+    ——把 ``:`` 统一成 ``/`` 后取最后一段。刻意不把 ``_``/``.`` 当分隔符：它们是 model 名合法字符
+    （wan2. / image-01 / kling-v3-omni 都含），当分隔符会切坏真实 model 名。未登记 model（含未来版本
+    kling-v4、归一化后仍不精确匹配的中转自定义 id）回落保守默认（首尾帧、无参考/音频）——绝不按子串猜
+    未知 model 的能力上限：未知 model 的限额可能与已知档不同，误报参考图能力会在请求期触发 provider 400
+    或计费漂移，宁可保守。"""
+    key = model.replace(":", "/").rsplit("/", 1)[-1].strip().lower()
+    return _KLING_VIDEO_CAPS.get(key, _DEFAULT_VIDEO_CAPS)
+
+
 _MIN_POLL_TIMEOUT_SECONDS = 900.0
 _POLL_TIMEOUT_PER_SECOND = 60.0
 _KLING_VIDEO_POLL_INTERVAL_SECONDS = 10.0
@@ -204,8 +217,8 @@ class KlingVideoBackend:
         else:
             raise ValueError(f"未知 Kling auth_mode: {auth_mode}")
 
-        # 按 model 取能力位；未登记 model（bearer 透传）回落保守默认。
-        self._caps = _KLING_VIDEO_CAPS.get(self._model, _DEFAULT_VIDEO_CAPS)
+        # 按 model 取能力位（归一化前缀/大小写后精确命中）；未登记 model（bearer 透传）回落保守默认。
+        self._caps = _lookup_video_caps(self._model)
 
     @property
     def name(self) -> str:
@@ -226,17 +239,24 @@ class KlingVideoBackend:
             caps.add(VideoCapability.GENERATE_AUDIO)
         return caps
 
-    @property
-    def video_capabilities(self) -> VideoCapabilities:
-        # first_frame 恒真（各档均支持 i2v 首帧）；last_frame / reference_images / 上限按 model。
-        # max_reference_images 同时声明于 registry ModelInfo（编排层裁剪读它）与此处（生成时防御），
-        # 取保守值、待 app.klingai.com 控制台核对。
+    @staticmethod
+    def video_capabilities_for_model(model: str) -> VideoCapabilities:
+        # first_frame 恒真（各档均支持 i2v 首帧）；last_frame / reference_images / 上限按 model 从
+        # _KLING_VIDEO_CAPS 读（_lookup_video_caps 归一化前缀/大小写后精确命中，未登记回落保守默认）。
+        # max_reference_images 同时声明于 registry ModelInfo（编排层裁剪读它）与此处（生成时防御），取保守
+        # 值、待 app.klingai.com 控制台核对。纯函数（不构造 client / 不需 api_key），供 custom endpoint
+        # resolver 按 model_id 读上限复用。
+        caps = _lookup_video_caps(model)
         return VideoCapabilities(
             first_frame=True,
-            last_frame=self._caps.last_frame,
-            reference_images=self._caps.reference_images,
-            max_reference_images=self._caps.max_reference_images,
+            last_frame=caps.last_frame,
+            reference_images=caps.reference_images,
+            max_reference_images=caps.max_reference_images,
         )
+
+    @property
+    def video_capabilities(self) -> VideoCapabilities:
+        return self.video_capabilities_for_model(self._model)
 
     # ── auth ────────────────────────────────────────────────────────────
 

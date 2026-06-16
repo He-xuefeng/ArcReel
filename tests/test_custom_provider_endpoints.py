@@ -32,6 +32,8 @@ class TestRegistry:
             "dashscope-async-video",
             "minimax-image",
             "minimax-video",
+            "kling-image",
+            "kling-video",
             "openai-tts",
         }
 
@@ -39,7 +41,7 @@ class TestRegistry:
         for key, spec in ENDPOINT_REGISTRY.items():
             assert spec.key == key
             assert spec.media_type in {"text", "image", "video", "audio"}
-            assert spec.family in {"openai", "google", "newapi", "v2", "ark", "vidu", "dashscope", "minimax"}
+            assert spec.family in {"openai", "google", "newapi", "v2", "ark", "vidu", "dashscope", "minimax", "kling"}
             assert spec.display_name_key.startswith("endpoint_")
             assert callable(spec.build_backend)
             assert spec.request_method == "POST"
@@ -62,8 +64,15 @@ class TestRegistry:
         }
 
     def test_new_video_endpoints_have_unset_cap(self):
-        """v2/ark/vidu/dashscope/minimax 不在 endpoint 维度声明上限，由 resolver 调 backend 纯 caps 函数读取。"""
-        for key in ("v2-video-generations", "ark-seedance", "vidu-video", "dashscope-async-video", "minimax-video"):
+        """v2/ark/vidu/dashscope/minimax/kling 不在 endpoint 维度声明上限，由 resolver 调 backend 纯 caps 函数读取。"""
+        for key in (
+            "v2-video-generations",
+            "ark-seedance",
+            "vidu-video",
+            "dashscope-async-video",
+            "minimax-video",
+            "kling-video",
+        ):
             assert ENDPOINT_REGISTRY[key].video_max_reference_images is None
         # 既有显式 int 保留，行为零变化
         assert ENDPOINT_REGISTRY["openai-video"].video_max_reference_images == 1
@@ -76,7 +85,14 @@ class TestRegistry:
         在 import 期保证（违反则本文件根本 import 不进来），故此处只断言「具体哪个 endpoint 选了哪条
         路径」——这是 XOR 校验抓不到的（换机制仍满足 XOR），是真正的回归护栏。"""
         # None-cap 的 video endpoint 必须绑定纯 caps 函数
-        for key in ("v2-video-generations", "ark-seedance", "vidu-video", "dashscope-async-video", "minimax-video"):
+        for key in (
+            "v2-video-generations",
+            "ark-seedance",
+            "vidu-video",
+            "dashscope-async-video",
+            "minimax-video",
+            "kling-video",
+        ):
             assert ENDPOINT_REGISTRY[key].video_caps_for_model is not None
         # 显式 int 的 video endpoint 不应再绑 caps 函数
         for key in ("openai-video", "newapi-video"):
@@ -101,6 +117,33 @@ class TestRegistry:
         hailuo = caps_fn("MiniMax-Hailuo-2.3")
         assert hailuo.first_frame is True
         assert hailuo.max_reference_images == 0
+
+    def test_kling_caps_fn_reads_per_model_limit_without_client(self):
+        """kling-video 的 caps_fn 是纯函数：v3-omni / video-o1 多图主体 R2V max_ref=4，turbo 等其余档
+        走首尾帧无参考（max_ref=0），未登记 model（bearer 透传）回落保守默认，resolver 据此解析而无需
+        构造 backend / api_key。"""
+        caps_fn = ENDPOINT_REGISTRY["kling-video"].video_caps_for_model
+        assert caps_fn is not None
+        omni = caps_fn("kling-v3-omni")
+        assert omni.reference_images is True
+        assert omni.max_reference_images == 4
+        o1 = caps_fn("kling-video-o1")
+        assert o1.reference_images is True
+        assert o1.max_reference_images == 4
+        turbo = caps_fn("kling-v2-5-turbo")
+        assert turbo.first_frame is True
+        assert turbo.reference_images is False
+        assert turbo.max_reference_images == 0
+        # 中转 model_id 带厂商前缀（仓库既有约定 / 与 :）+ 非规范大小写：归一化后仍能精确命中已登记档
+        for prefixed_id in ("vendor/Kling-V3-Omni", "provider:kling-v3-omni"):
+            prefixed = caps_fn(prefixed_id)
+            assert prefixed.reference_images is True
+            assert prefixed.max_reference_images == 4
+        # 未登记 model（未来版本 kling-v4 / 归一化后仍不匹配的中转自定义 id）→ 保守默认，不按子串猜能力
+        for unknown_id in ("kling-v4", "vendor/some-unknown-model"):
+            unknown = caps_fn(unknown_id)
+            assert unknown.reference_images is False
+            assert unknown.max_reference_images == 0
 
     def test_negative_int_cap_rejected_at_validation(self, monkeypatch: pytest.MonkeyPatch):
         """import 期不变式拒绝负数 int cap：下游 references[:-1] 会误丢最后一张而非裁成 0 张。"""
@@ -156,6 +199,7 @@ class TestRegistry:
             "gemini-image",
             "dashscope-image",
             "minimax-image",
+            "kling-image",
         }
         assert video_keys == {
             "openai-video",
@@ -165,6 +209,7 @@ class TestRegistry:
             "vidu-video",
             "dashscope-async-video",
             "minimax-video",
+            "kling-video",
         }
 
 
@@ -222,7 +267,6 @@ class TestInferEndpoint:
             ("flux-pro", "openai", "openai-images"),
             ("sora-2", "openai", "openai-video"),
             ("SORA-2", "openai", "openai-video"),
-            ("kling-v2", "openai", "openai-video"),
             ("veo-3", "openai", "openai-video"),
             ("veo-3", "google", "openai-video"),  # 非 seedance/viduq3/minimax 视频 → openai-video
             # ── MiniMax 原生 token 二级路由 ──
@@ -239,6 +283,23 @@ class TestInferEndpoint:
             ("image-01", "openai", "minimax-image"),  # image-01 含 "image" 否则会被推到通用图像家族
             ("minimax/image-01", "openai", "minimax-image"),
             ("S2V-01", "google", "minimax-video"),  # minimax 路由不分 discovery_format
+            # ── Kling 原生中转二级路由（视频 family 含 kling，须收敛到 kling-video 而非 openai-video）──
+            ("kling-v2-5-turbo", "openai", "kling-video"),
+            ("kling-v2", "openai", "kling-video"),  # 前 kling endpoint 时代默认 openai-video
+            ("kling-v3", "openai", "kling-video"),
+            ("kling-v2-6", "openai", "kling-video"),
+            ("proxy/kling-v2-5-turbo", "openai", "kling-video"),
+            ("KLING-V3", "openai", "kling-video"),  # 大小写不敏感
+            ("kling-v3-omni", "openai", "kling-video"),  # 图像/视频同名歧义 → 默认归视频
+            # 含 image 语义的可灵图像 → kling-image（先于通用图像家族，不被推到 openai-images）
+            ("kling-image-o1", "openai", "kling-image"),
+            ("kling-v3-omni-image", "openai", "kling-image"),
+            ("proxy/kling-image-o1", "openai", "kling-image"),
+            ("kling-image-o1", "google", "kling-image"),  # kling 路由不分 discovery_format
+            # image-to-video 含 image 语义但本质是视频 → video 优先于 image，归 kling-video
+            ("kling-image2video", "openai", "kling-video"),
+            ("kling-img2video", "openai", "kling-video"),
+            ("proxy/kling-image2video", "openai", "kling-video"),
             ("seedream-3.0", "openai", "openai-images"),
             ("jimeng-3.0", "openai", "openai-images"),
             ("jimeng-video-3.0", "openai", "openai-video"),
@@ -303,6 +364,7 @@ def test_image_endpoint_registry_entries():
         "gemini-image",
         "dashscope-image",
         "minimax-image",
+        "kling-image",
     }
 
 
