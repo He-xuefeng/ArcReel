@@ -15,6 +15,7 @@ from lib.kling_shared import (
     extract_kling_task_id,
     extract_kling_video_url,
     is_kling_task_terminal,
+    kling_auth_mode,
     kling_bearer_headers,
     kling_response_error,
     kling_task_failure_reason,
@@ -92,6 +93,29 @@ class TestBearerMode:
         assert headers["Authorization"] == "Bearer static-api-key"
 
 
+class TestAuthModeDispatch:
+    """kling_auth_mode：内置 provider 构造与连接测试共用的凭证形态判定（api_key 优先）。"""
+
+    def test_api_key_present_dispatches_bearer(self):
+        assert kling_auth_mode({"api_key": "sk-1", "access_key": None, "secret_key": None}) == "bearer"
+
+    def test_only_dual_secret_dispatches_jwt(self):
+        assert kling_auth_mode({"api_key": None, "access_key": "ak-1", "secret_key": "sk-1"}) == "jwt"
+
+    def test_both_set_prefers_bearer(self):
+        assert kling_auth_mode({"api_key": "sk-1", "access_key": "ak-1", "secret_key": "sk-1"}) == "bearer"
+
+    def test_empty_api_key_falls_back_to_jwt(self):
+        assert kling_auth_mode({"api_key": "", "access_key": "ak-1", "secret_key": "sk-1"}) == "jwt"
+
+    def test_neither_set_falls_back_to_jwt(self):
+        assert kling_auth_mode({}) == "jwt"
+
+    def test_whitespace_only_api_key_falls_back_to_jwt(self):
+        # 纯空格 api_key 不应误判为已填写 bearer，静默吞掉同时存在的有效 AK/SK。
+        assert kling_auth_mode({"api_key": "   ", "access_key": "ak-1", "secret_key": "sk-1"}) == "jwt"
+
+
 class TestCredentialResolution:
     def test_jwt_credentials_strip_and_return(self):
         assert resolve_kling_jwt_credentials(" ak ", " sk ") == ("ak", "sk")
@@ -108,7 +132,7 @@ class TestCredentialResolution:
 
 class TestResponseParsing:
     def test_base_url_constant(self):
-        assert KLING_BASE_URL == "https://api.klingai.com/v1"
+        assert KLING_BASE_URL == "https://api-beijing.klingai.com/v1"
 
     def test_extract_task_id(self):
         payload = {"code": 0, "message": "SUCCEED", "data": {"task_id": "t-1", "task_status": "submitted"}}
@@ -130,6 +154,29 @@ class TestResponseParsing:
         assert kling_response_error({"code": "5", "message": "boom"}) == "Kling API code=5: boom"
         # 无法解析的 code 视为错误，暴露原值。
         assert kling_response_error({"code": "oops", "message": "bad"}) == "Kling API code=oops: bad"
+
+    def test_inner_data_code_error(self):
+        # account/costs 等接口顶层 code=0 通过后，data 内嵌的业务级 code/msg 仍需暴露。
+        payload = {"code": 0, "message": "", "data": {"code": 1234, "msg": "resource pack not found"}}
+        assert kling_response_error(payload) == "Kling API code=1234: resource pack not found"
+
+    def test_inner_data_code_zero_not_error(self):
+        payload = {"code": 0, "message": "", "data": {"code": 0, "msg": ""}}
+        assert kling_response_error(payload) is None
+
+    def test_inner_data_without_code_key_not_error(self):
+        # 提交/轮询类接口的 data（task_id / task_status 等）不含 code 键，该检查为 no-op。
+        assert kling_response_error({"code": 0, "data": {"task_id": "t-1", "task_status": "submitted"}}) is None
+
+    def test_non_dict_payload_normalized_not_error(self):
+        # 中转 endpoint / 异常网关可能返回非对象 JSON（数组、字符串等），按空 dict 处理，
+        # 不因 .get() 触发 AttributeError。
+        assert kling_response_error([]) is None
+        assert kling_response_error("oops") is None
+
+    def test_non_dict_nested_data_normalized_not_error(self):
+        # data 字段本身也可能是非对象 JSON（如字符串错误信息），同样归一化为空 dict。
+        assert kling_response_error({"code": 0, "message": "", "data": "unexpected"}) is None
 
     def test_terminal_states(self):
         assert is_kling_task_terminal({"data": {"task_status": "succeed"}}) is True

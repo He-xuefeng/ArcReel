@@ -107,8 +107,9 @@ class FieldInfo(BaseModel):
 class CredentialSecretField(BaseModel):
     """凭证表单需渲染的 secret 输入字段（按 provider 的 required ∩ secret ∩ 凭证键派生）。
 
-    驱动设置页凭证表单渲染：单 secret provider 给 ``[api_key]``，可灵给
-    ``[access_key, secret_key]``（见 ADR 0037）。key 名全程同名，前端据此读写各字段。
+    驱动设置页凭证表单渲染：单 secret provider 给 ``[api_key]``（见 ADR 0037），可灵给
+    ``[api_key, access_key, secret_key]``（二选一分组见 ``secret_field_groups``）。
+    key 名全程同名，前端据此读写各字段。
     """
 
     key: str
@@ -127,6 +128,10 @@ class ProviderConfigResponse(BaseModel):
     supports_base_url: bool
     # 凭证表单应渲染的 secret 字段（有序，真相源：registry required_keys ∩ secret_keys ∩ 凭证键）。
     secret_fields: list[CredentialSecretField]
+    # 凭证「二选一」分组：前端据此校验「至少一组的字段全部填写」而非「全部字段都填写」
+    # （真相源：registry credential_groups；空声明时 router 回退为 [全部 secret_fields]，
+    # 与迁移前「全部必填」语义等价）。
+    secret_field_groups: list[list[str]]
 
 
 class ConnectionTestResponse(BaseModel):
@@ -324,13 +329,20 @@ async def get_provider_config(
             fields.append(_build_field(key, required=False, db_entry=db_values.get(key)))
 
     # 凭证表单的 secret 输入字段：required ∩ secret ∩ 凭证键，保留 required_keys 顺序。
-    # 单 secret provider → [api_key]；可灵 → [access_key, secret_key]（见 ADR 0037）。
+    # 单 secret provider → [api_key]（见 ADR 0037）；可灵 → [api_key, access_key, secret_key]，
+    # 二选一分组见下方 secret_field_groups。
     secret_keys = set(meta.secret_keys)
     secret_fields = [
         CredentialSecretField(key=key, label=_FIELD_META.get(key, {"label": key})["label"])
         for key in meta.required_keys
         if key in _CREDENTIAL_KEYS and key in secret_keys
     ]
+    # 空声明（绝大多数单 secret / 双 secret-AND provider）回退为单一必填组 = 全部 secret_fields，
+    # 与迁移前「全部必填」语义等价；仅可灵声明了非空 credential_groups（api_key 单键 /
+    # access_key+secret_key 双键二选一）。secret_fields 为空时（当前仅 gemini-vertex，走文件
+    # 上传分支不经过分组校验）不合成 [[]]——与 registry.py 的空分组 fail-fast 语义保持一致，
+    # 避免未来新增"无 secret 字段但走普通凭证表单"的 provider 时该分组恒真、静默绕过校验。
+    secret_field_groups = meta.credential_groups or ([[f.key for f in secret_fields]] if secret_fields else [])
 
     return ProviderConfigResponse(
         id=provider_id,
@@ -341,6 +353,7 @@ async def get_provider_config(
         fields=fields,
         supports_base_url="base_url" in meta.optional_keys,
         secret_fields=secret_fields,
+        secret_field_groups=secret_field_groups,
     )
 
 
@@ -737,6 +750,67 @@ def _test_minimax(config: dict[str, str], _t: Callable[..., str]) -> ConnectionT
     )
 
 
+def _test_kling(config: dict[str, str], _t: Callable[..., str]) -> ConnectionTestResponse:
+    """通过查询账户资源包余量验证可灵凭证（``GET /account/costs``，官方标注 free-to-call、无副作用）。
+
+    双模式鉴权二选一，判定收口于 kling_auth_mode（与 backend_assembly._build_kling 共用，保证
+    实际生成任务与连接测试的分派顺序恒一致）；缺失时 resolve_kling_api_key /
+    resolve_kling_jwt_credentials 抛出的 ValueError 经上层 except 转成明确的 connection_failed
+    文案。account/costs 挂在域名根路径（不带 /v1 版本前缀），需从 base_url 剥离该后缀。
+    """
+    import time
+
+    import httpx
+
+    from lib.kling_shared import (
+        KLING_BASE_URL,
+        KlingJWTManager,
+        kling_auth_mode,
+        kling_bearer_headers,
+        kling_response_error,
+        resolve_kling_api_key,
+        resolve_kling_jwt_credentials,
+    )
+
+    if kling_auth_mode(config) == "bearer":
+        headers = kling_bearer_headers(resolve_kling_api_key(config.get("api_key")))
+    else:
+        access_key, secret_key = resolve_kling_jwt_credentials(config.get("access_key"), config.get("secret_key"))
+        headers = KlingJWTManager(access_key, secret_key).auth_headers()
+
+    base_url = (config.get("base_url") or KLING_BASE_URL).rstrip("/")
+    root = base_url.removesuffix("/v1")
+    now_ms = int(time.time() * 1000)
+    one_day_ms = 24 * 60 * 60 * 1000
+    resp = httpx.get(
+        f"{root}/account/costs",
+        params={"start_time": now_ms - one_day_ms, "end_time": now_ms},
+        headers=headers,
+        timeout=_CONNECTION_TEST_TIMEOUT,
+    )
+    # JSON 错误体先于 raise_for_status 解析：鉴权失败等场景可灵仍带 JSON 错误体（业务 code +
+    # message，如"access key 不存在"），先于 raise_for_status 提取能保留这份具体原因；否则
+    # 4xx/5xx 直接 raise 会丢弃响应体，只剩泛泛的 HTTP 状态文案。content-type 声称 JSON 但
+    # 实际非法/空体（如异常网关截断响应）时解析会抛 JSONDecodeError——按声明的 content-type
+    # 判断是否尝试解析，不代表响应体一定合法，解析失败即放弃业务错误提取，跳过、直接走
+    # raise_for_status 兜底暴露 HTTP 状态，而非让解析异常本身掩盖更具体的 HTTP 错误。
+    if "application/json" in resp.headers.get("content-type", ""):
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        if payload is not None:
+            err = kling_response_error(payload)
+            if err is not None:
+                raise RuntimeError(err)
+    resp.raise_for_status()
+    return ConnectionTestResponse(
+        success=True,
+        available_models=[],
+        message=_t("connection_success"),
+    )
+
+
 _TEST_DISPATCH: dict[str, Callable[[dict[str, str], Any], ConnectionTestResponse]] = {
     "gemini-aistudio": _test_gemini_aistudio,
     "gemini-vertex": _test_gemini_vertex,
@@ -747,6 +821,7 @@ _TEST_DISPATCH: dict[str, Callable[[dict[str, str], Any], ConnectionTestResponse
     "vidu": _test_vidu,
     "dashscope": _test_dashscope,
     "minimax": _test_minimax,
+    "kling": _test_kling,
 }
 
 
