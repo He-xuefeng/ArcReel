@@ -321,3 +321,67 @@ class TestWarnIfTruncated:
 
         with caplog.at_level(logging.WARNING, logger="lib.text_backends.base"):
             assert warn_if_truncated("MAX_TOKENS", provider="gemini", model="g") is True
+
+
+class TestCheckTruncation:
+    """结构化输出截断升级为硬错误，自由文本维持仅告警（见 docs/adr/0044）。"""
+
+    def test_structured_truncation_raises(self, caplog):
+        import logging
+
+        import pytest
+
+        from lib.text_backends.base import TextOutputTruncatedError, check_truncation
+
+        with caplog.at_level(logging.WARNING, logger="lib.text_backends.base"):
+            with pytest.raises(TextOutputTruncatedError) as exc_info:
+                check_truncation("length", provider="ark", model="doubao", output_tokens=8192, structured=True)
+
+        exc = exc_info.value
+        assert exc.provider == "ark"
+        assert exc.model == "doubao"
+        assert exc.output_tokens == 8192
+        # 点名当前模型 + 换模型建议
+        assert "ark/doubao" in str(exc)
+        assert "输出能力更高的文本模型" in str(exc)
+        assert "output_tokens=8192" in str(exc)
+
+    def test_structured_truncation_without_output_tokens_omits_placeholder(self):
+        """供应商响应缺失 usage 信息时 output_tokens 为 None，错误消息不应显示 "output_tokens=None"。"""
+        import pytest
+
+        from lib.text_backends.base import TextOutputTruncatedError, check_truncation
+
+        with pytest.raises(TextOutputTruncatedError) as exc_info:
+            check_truncation("length", provider="ark", model="doubao", output_tokens=None, structured=True)
+
+        assert "None" not in str(exc_info.value)
+
+    def test_free_text_truncation_only_warns(self, caplog):
+        import logging
+
+        from lib.text_backends.base import check_truncation
+
+        with caplog.at_level(logging.WARNING, logger="lib.text_backends.base"):
+            check_truncation("length", provider="ark", model="doubao", structured=False)
+
+        assert any("被截断" in r.message for r in caplog.records)
+
+    def test_no_truncation_structured_does_not_raise(self):
+        from lib.text_backends.base import check_truncation
+
+        check_truncation("stop", provider="ark", model="doubao", structured=True)
+
+    def test_none_finish_reason_structured_does_not_raise(self):
+        from lib.text_backends.base import check_truncation
+
+        check_truncation(None, provider="ark", model="doubao", structured=True)
+
+    def test_truncated_error_is_non_retryable(self):
+        """TextOutputTruncatedError 须是 NonRetryableError,否则消息里的 output_tokens 整数
+        偶然命中 with_retry_async 的瞬态错误模式子串（如 429/500）时会被误判重试
+        （见 lib/retry.py::NonRetryableError）。"""
+        from lib.retry import NonRetryableError
+        from lib.text_backends.base import TextOutputTruncatedError
+
+        assert issubclass(TextOutputTruncatedError, NonRetryableError)
