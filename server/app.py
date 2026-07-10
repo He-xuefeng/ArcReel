@@ -21,8 +21,6 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -602,24 +600,11 @@ async def serve_skill_md(request: Request) -> Response:
     return PlainTextResponse(content, media_type="text/markdown; charset=utf-8")
 
 
-# 前端构建产物：SPA 静态文件服务（必须在所有显式路由之后挂载）
+# 前端构建产物：SPA 静态文件服务。fallback 仅对 GET/HEAD 生效，写请求误入页面路径返回 404
 frontend_dist_dir = PROJECT_ROOT / "frontend" / "dist"
 
-
-class SPAStaticFiles(StaticFiles):
-    """服务 Vite 构建产物，未匹配的路径回退到 index.html（SPA 路由）。"""
-
-    async def get_response(self, path: str, scope):
-        try:
-            return await super().get_response(path, scope)
-        except StarletteHTTPException as exc:
-            if exc.status_code == 404:
-                return await super().get_response("index.html", scope)
-            raise
-
-
 if frontend_dist_dir.exists():
-    app.mount("/", SPAStaticFiles(directory=frontend_dist_dir, html=True), name="frontend")
+    app.frontend("/", directory=frontend_dist_dir, fallback="index.html")
 
 
 if __name__ == "__main__":
