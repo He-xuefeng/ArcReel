@@ -601,6 +601,21 @@ async def serve_skill_md(request: Request) -> Response:
     return PlainTextResponse(content, media_type="text/markdown; charset=utf-8")
 
 
+@app.middleware("http")
+async def spa_shell_no_cache_middleware(request: Request, call_next):
+    """SPA 入口 HTML 外壳禁止浏览器缓存。
+
+    覆盖 spa_deep_link 与 app.frontend 原生 fallback 两条路径共用的响应特征
+    （text/html），否则重新部署后浏览器可能沿用旧壳加载已被删除的旧哈希资源，
+    导致白屏——按 content-type 而非按路由判定，才能同时管住 "/"、"/login" 等
+    落在原生 fallback 上的入口。
+    """
+    response: Response = await call_next(request)
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
+
+
 # 前端构建产物：SPA 静态文件服务。fallback 仅对 GET/HEAD 生效，写请求误入页面路径不再返回页面。
 # 挂载条件必须检查 index.html 而非目录：app.frontend 在启动期校验 fallback 文件，
 # 构建产物不完整时会抛 RuntimeError 拖垮整个应用（含全部 API）
