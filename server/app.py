@@ -21,6 +21,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -600,11 +601,22 @@ async def serve_skill_md(request: Request) -> Response:
     return PlainTextResponse(content, media_type="text/markdown; charset=utf-8")
 
 
-# 前端构建产物：SPA 静态文件服务。fallback 仅对 GET/HEAD 生效，写请求误入页面路径返回 404
+# 前端构建产物：SPA 静态文件服务。fallback 仅对 GET/HEAD 生效，写请求误入页面路径不再返回页面。
+# 挂载条件必须检查 index.html 而非目录：app.frontend 在启动期校验 fallback 文件，
+# 构建产物不完整时会抛 RuntimeError 拖垮整个应用（含全部 API）
 frontend_dist_dir = PROJECT_ROOT / "frontend" / "dist"
 
-if frontend_dist_dir.exists():
+if (frontend_dist_dir / "index.html").is_file():
+
+    @app.get("/app/{_rest:path}", include_in_schema=False)
+    async def spa_deep_link(_rest: str) -> FileResponse:
+        # SPA 深链末段可能带扩展名（如 /app/projects/x/source/chapter1.txt），
+        # app.frontend 的 fallback 会将其判为静态资源请求返回 404，此处显式兜底回 SPA 外壳
+        return FileResponse(frontend_dist_dir / "index.html")
+
     app.frontend("/", directory=frontend_dist_dir, fallback="index.html")
+else:
+    logger.warning("frontend/dist/index.html 不存在，跳过前端页面挂载（API 不受影响）")
 
 
 if __name__ == "__main__":
