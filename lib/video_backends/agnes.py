@@ -1,8 +1,8 @@
 """AgnesVideoBackend — Agnes 视频生成后端（裸 base64 + 异步轮询 + resume）。
 
 走 apihub 网关上的 OpenAI 风格异步端点：submit ``POST /v1/videos``（JSON）取 task_id →
-轮询 ``GET /v1/videos/{task_id}`` 至 ``status=completed`` → 从响应 ``remixed_from_video_id``
-字段取成片 mp4 URL → 下载本地。状态机 ``queued → in_progress → completed / failed``。
+轮询 ``GET /v1/videos/{task_id}`` 至 ``status=completed`` → 从响应 ``url`` 字段（优先）或
+``remixed_from_video_id`` 字段（回退）取成片 mp4 URL → 下载本地。状态机 ``queued → in_progress → completed / failed``。
 
 能力约束：fps 固定 24；时长 1–18s（内部 ``num_frames = 最近的 8n+1``，由秒 × fps 取整对齐，
 上限 441 帧）；分辨率经 aspect_size 精确算出并显式下发 ``height`` × ``width``（不显式下发时
@@ -419,10 +419,11 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
             ),
         )
 
-        video_url = final.get("remixed_from_video_id")
+        # 优先使用 url 字段，回退到 remixed_from_video_id（兼容旧版响应格式）
+        video_url = final.get("url") or final.get("remixed_from_video_id")
         if not isinstance(video_url, str) or not video_url:
             # 仅暴露字段名，不回显整串响应（可能含签名 URL 等敏感字段，与 _safe_body_for_log 同口径）。
-            raise RuntimeError(f"Agnes 任务完成但缺少 remixed_from_video_id 成片 URL（字段: {sorted(final)}）")
+            raise RuntimeError(f"Agnes 任务完成但缺少成片 URL（字段: {sorted(final)}）")
 
         await self._download_with_retry(video_url, request.output_path)
         logger.info("Agnes 视频下载完成: %s", request.output_path)
