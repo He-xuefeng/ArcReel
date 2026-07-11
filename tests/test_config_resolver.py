@@ -159,6 +159,79 @@ class TestDefaultBackends:
         finally:
             await engine.dispose()
 
+
+class TestProviderConfigCredentialOverlay:
+    async def test_provider_config_with_credential_id_overlays_that_credential(self):
+        from lib.config.service import ConfigService
+        from lib.db.repositories.credential_repository import CredentialRepository
+
+        factory, engine = await _make_session()
+        try:
+            async with factory() as session:
+                svc = ConfigService(session)
+                await svc.set_provider_config("gemini-aistudio", "api_key", "base-key")
+                repo = CredentialRepository(session)
+                active = await repo.create("gemini-aistudio", "active", api_key="active-key")
+                selected = await repo.create("gemini-aistudio", "selected", api_key="selected-key")
+                await session.commit()
+
+            resolver = ConfigResolver(factory)
+            active_config = await resolver.provider_config("gemini-aistudio")
+            selected_config = await resolver.provider_config("gemini-aistudio", credential_id=selected.id)
+
+            assert active_config["api_key"] == "active-key"
+            assert selected_config["api_key"] == "selected-key"
+            assert active.id != selected.id
+        finally:
+            await engine.dispose()
+
+    async def test_provider_config_rejects_credential_from_other_provider(self):
+        from lib.db.repositories.credential_repository import CredentialRepository
+
+        factory, engine = await _make_session()
+        try:
+            async with factory() as session:
+                repo = CredentialRepository(session)
+                credential = await repo.create("ark", "ark", api_key="ark-key")
+                await session.commit()
+
+            resolver = ConfigResolver(factory)
+            with pytest.raises(ValueError, match="does not belong"):
+                await resolver.provider_config("gemini-aistudio", credential_id=credential.id)
+        finally:
+            await engine.dispose()
+
+    async def test_provider_config_rejects_credential_for_custom_provider(self):
+        factory, engine = await _make_session()
+        try:
+            resolver = ConfigResolver(factory)
+            with pytest.raises(ValueError, match="custom providers"):
+                await resolver.provider_config("custom-1", credential_id=1)
+        finally:
+            await engine.dispose()
+
+    async def test_pool_settings_defaults_and_reads_config(self):
+        from lib.config.service import ConfigService
+
+        factory, engine = await _make_session()
+        try:
+            resolver = ConfigResolver(factory)
+            defaults = await resolver.pool_settings("gemini-aistudio")
+            assert defaults.enabled is False
+            assert defaults.concurrency_mode == "shared"
+
+            async with factory() as session:
+                svc = ConfigService(session)
+                await svc.set_provider_config("gemini-aistudio", "credential_pool_enabled", "true")
+                await svc.set_provider_config("gemini-aistudio", "credential_pool_concurrency_mode", "separate")
+                await session.commit()
+
+            configured = await resolver.pool_settings("gemini-aistudio")
+            assert configured.enabled is True
+            assert configured.concurrency_mode == "separate"
+        finally:
+            await engine.dispose()
+
     async def test_video_backend_auto_resolve_no_ready_provider(self):
         """无 ready 供应商且无自定义供应商时抛出 ValueError。"""
         resolver = ConfigResolver.__new__(ConfigResolver)

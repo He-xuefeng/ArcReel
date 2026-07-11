@@ -104,6 +104,38 @@ def _providers() -> str:
     return ", ".join(ids) if ids else "<none>"
 
 
+def _provider_credential_pools() -> str:
+    import asyncio
+
+    from lib.config.registry import PROVIDER_REGISTRY
+    from lib.db import safe_session_factory
+    from lib.db.repositories.credential_pool_repository import CredentialPoolRepository
+
+    async def _collect() -> str:
+        async with safe_session_factory() as session:
+            repo = CredentialPoolRepository(session)
+            summaries = await repo.list_pool_summaries(set(PROVIDER_REGISTRY.keys()))
+        lines: list[str] = []
+        for provider_id in sorted(PROVIDER_REGISTRY.keys()):
+            summary = summaries.get(provider_id)
+            if summary is None:
+                lines.append(f"- {provider_id}: enabled=false mode=shared enabled_credentials=0 active_leases=0")
+                continue
+            lines.append(
+                f"- {provider_id}: enabled={str(summary.enabled).lower()} "
+                f"mode={summary.concurrency_mode} "
+                f"enabled_credentials={summary.enabled_credentials_count} "
+                f"active_leases={summary.active_lease_count}"
+            )
+        return "\n".join(lines) if lines else "<none>"
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_collect())
+    return "<unavailable: diagnostics called from running event loop>"
+
+
 def collect_diagnostics() -> str:
     """返回脱敏的 plain-text 诊断报告。任一字段失败用 <unavailable> 占位，整体不抛。"""
     fields: list[tuple[str, Callable[[], object]]] = [
@@ -116,6 +148,7 @@ def collect_diagnostics() -> str:
         ("Log level", _log_level),
         ("Sandbox", _sandbox_status),
         ("Registered providers", _providers),
+        ("Provider credential pools", _provider_credential_pools),
         ("Report generated", lambda: datetime.now(UTC).isoformat()),
     ]
 

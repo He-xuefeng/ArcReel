@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from lib.config.service import ConfigService, ProviderStatus
 from lib.db import get_async_session
 from lib.db.models.credential import ProviderCredential
+from lib.db.repositories.credential_pool_repository import CredentialPoolSummary
 from lib.db.repositories.credential_repository import CredentialRepository
 from lib.i18n import get_translator
 from server.dependencies import get_config_service
@@ -26,6 +27,16 @@ from tests.conftest import make_translator
 # ---------------------------------------------------------------------------
 # 测试应用工厂
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _mock_pool_repo(monkeypatch):
+    repo = MagicMock()
+    repo.list_pool_summaries = AsyncMock(return_value={})
+    repo.active_lease_counts_by_credential = AsyncMock(return_value={})
+    repo.has_active_or_resumable_work = AsyncMock(return_value=False)
+    monkeypatch.setattr(providers, "CredentialPoolRepository", lambda _session: repo)
+    return repo
 
 
 def _make_app(mock_svc: ConfigService) -> FastAPI:
@@ -252,6 +263,36 @@ class TestGetProviderConfig:
         assert body["display_name"] == "AI Studio"
         assert body["status"] == "ready"
         assert isinstance(body["fields"], list)
+        assert body["credential_pool_enabled"] is False
+        assert body["credential_pool_concurrency_mode"] == "shared"
+        assert body["credential_pool_summary"] == {
+            "enabled_credentials_count": 0,
+            "active_lease_count": 0,
+        }
+
+    def test_pool_summary_fields(self, _mock_pool_repo):
+        app, _ = _make_session_app()
+        _mock_pool_repo.list_pool_summaries = AsyncMock(
+            return_value={
+                "gemini-aistudio": CredentialPoolSummary(
+                    enabled=True,
+                    concurrency_mode="separate",
+                    enabled_credentials_count=2,
+                    active_lease_count=1,
+                )
+            }
+        )
+        with (
+            patch("server.routers.providers.ConfigService", return_value=self._mock_svc_ready()),
+            patch("server.routers.providers.CredentialRepository", return_value=self._mock_cred_repo_active()),
+        ):
+            with TestClient(app) as client:
+                resp = client.get("/api/v1/providers/gemini-aistudio/config")
+        body = resp.json()
+        assert body["credential_pool_enabled"] is True
+        assert body["credential_pool_concurrency_mode"] == "separate"
+        assert body["credential_pool_summary"]["enabled_credentials_count"] == 2
+        assert body["credential_pool_summary"]["active_lease_count"] == 1
 
     def test_credential_fields_not_in_response(self):
         """api_key / base_url / credentials_path 不应出现在 fields 中。"""
@@ -508,6 +549,31 @@ class TestPatchProviderConfig:
 
         assert resp.status_code == 204
         mock_svc.set_provider_config.assert_awaited_once_with("gemini-aistudio", "api_key", "AIza-test", flush=False)
+
+
+class TestPatchProviderCredential:
+    def test_update_non_active_credential_invalidates_caches(self):
+        cred = ProviderCredential(provider="gemini-aistudio", name="pool-key", api_key="old", is_active=False)
+        cred.id = 7
+        repo = MagicMock(spec=CredentialRepository)
+        repo.get_by_id = AsyncMock(return_value=cred)
+        repo.update = AsyncMock()
+
+        app, mock_session = _make_session_app()
+        with (
+            patch("server.routers.providers.CredentialRepository", return_value=repo),
+            patch("server.routers.providers._invalidate_caches", new_callable=AsyncMock) as invalidate,
+        ):
+            with TestClient(app) as client:
+                resp = client.patch(
+                    "/api/v1/providers/gemini-aistudio/credentials/7",
+                    json={"api_key": "new"},
+                )
+
+        assert resp.status_code == 204
+        repo.update.assert_awaited_once_with(7, api_key="new")
+        mock_session.commit.assert_awaited_once()
+        invalidate.assert_awaited_once()
 
 
 class TestPatchProviderConfigMaxWorkersValidation:
@@ -935,8 +1001,9 @@ class TestTestProviderConnection:
     def test_specific_credential_id(self):
         """使用 credential_id 参数测试特定凭证。"""
         repo = MagicMock(spec=CredentialRepository)
-        cred = self._fake_cred()
-        repo.get_by_id = AsyncMock(return_value=cred)
+        cred = ProviderCredential(provider="gemini-aistudio", name="测试Key", api_key="AIzaSyFAKE", is_active=True)
+        cred.id = 1
+        repo.get_by_id_for_provider = AsyncMock(return_value=cred)
         repo.get_active = AsyncMock(return_value=None)
 
         app, _ = _make_session_app()

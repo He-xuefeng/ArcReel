@@ -30,6 +30,12 @@ FAILURE_CODE_KEYS: dict[str, str] = {
     "resume_unsupported_capacity_zero": "task_fail_resume_unsupported_capacity_zero",
     "resume_unsupported_detail": "task_fail_resume_unsupported_detail",
     "resume_expired_detail": "task_fail_resume_expired_detail",
+    "waiting_for_credential": "task_fail_waiting_for_credential",
+    "credential_lease_conflict": "task_fail_credential_lease_conflict",
+    "credential_binding_persist_failed": "task_fail_credential_binding_persist_failed",
+    "credential_binding_missing": "task_fail_credential_binding_missing",
+    "credential_in_use": "task_fail_credential_in_use",
+    "credential_lease_release_failed": "task_fail_credential_lease_release_failed",
 }
 
 # A structured reason is ``[code]`` optionally followed by a single space and a

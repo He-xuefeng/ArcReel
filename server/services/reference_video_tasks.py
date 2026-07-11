@@ -267,6 +267,7 @@ async def execute_reference_video_task(
     *,
     user_id: str = DEFAULT_USER_ID,
     task_id: str | None = None,
+    credential_id: int | None = None,
 ) -> dict[str, Any]:
     """处理一个 reference_video unit 的生成。
 
@@ -308,7 +309,7 @@ async def execute_reference_video_task(
         source_refs = _resolve_unit_references(project, project_path, unit.get("references") or [])
 
     # 3. 构造 generator（拿到 video_backend 名字后才能做 provider 特判）
-    generator = await get_media_generator(project_name, payload=payload, user_id=user_id)
+    generator = await get_media_generator(project_name, payload=payload, user_id=user_id, credential_id=credential_id)
     backend = getattr(generator, "_video_backend", None)
     provider_name = getattr(backend, "name", "") if backend else ""
     model_name = getattr(backend, "model", "") if backend else ""

@@ -15,11 +15,18 @@ class _FakeWorker:
     def __init__(self):
         self.started = False
         self.stopped = False
+        self.events: list[str] = []
+
+    async def reload_limits(self):
+        self.events.append("reload")
+        assert not self.started
 
     async def start(self):
+        self.events.append("start")
         self.started = True
 
     async def stop(self):
+        self.events.append("stop")
         self.stopped = True
 
     def request_cancel(self, _task_id: str) -> bool:
@@ -49,17 +56,15 @@ class TestAppModule:
         async with app_module.lifespan(app):
             assert worker.started
             assert hasattr(app.state, "generation_worker")
+            assert worker.events[:2] == ["reload", "start"]
 
         assert worker.stopped
 
     @pytest.mark.asyncio
     async def test_lifespan_clears_callback_after_worker_stop(self, monkeypatch):
-        """fix #647 #7：lifespan 应先 worker.stop()（drain inflight + callback 仍可用），
-        再清掉 set_worker_cancel_callback(None)。
-        """
+        """lifespan should keep the cancel callback available while worker.stop() drains inflight tasks."""
         from lib.generation_queue import get_generation_queue
 
-        # 用一个会在 stop() 时记录 callback 状态的 fake worker
         callback_during_stop: list[bool] = []
         queue = get_generation_queue()
 
@@ -68,11 +73,13 @@ class TestAppModule:
                 self.started = False
                 self.stopped = False
 
+            async def reload_limits(self):
+                pass
+
             async def start(self):
                 self.started = True
 
             async def stop(self):
-                # 检查 stop() 调用期间 callback 还在
                 callback_during_stop.append(queue._worker_cancel_callback is not None)
                 self.stopped = True
 
@@ -91,11 +98,8 @@ class TestAppModule:
         app.state = SimpleNamespace()
 
         async with app_module.lifespan(app):
-            # lifespan 启动后 callback 应已 set
             assert queue._worker_cancel_callback is not None
 
-        # 关键断言：worker.stop() 调用期间 callback 仍然存在
-        assert callback_during_stop == [True], f"stop() 时 callback 应仍可用，实际 {callback_during_stop}"
-        # 退出后 callback 已清
+        assert callback_during_stop == [True], f"stop() should still have callback available, got {callback_during_stop}"
         assert queue._worker_cancel_callback is None
         assert worker.stopped

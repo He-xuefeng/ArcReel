@@ -35,6 +35,96 @@ async def test_execute_generation_task_rejects_unknown_type():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", ["storyboard", "tts", "reference_video"])
+async def test_execute_generation_task_passes_credential_id_to_executor(monkeypatch, task_type):
+    from server.services import generation_tasks
+
+    seen: dict[str, object] = {}
+
+    async def fake_executor(project_name, resource_id, payload, *, user_id, task_id=None, credential_id=None):
+        seen.update(
+            {
+                "project_name": project_name,
+                "resource_id": resource_id,
+                "payload": payload,
+                "user_id": user_id,
+                "task_id": task_id,
+                "credential_id": credential_id,
+            }
+        )
+        return {"ok": True}
+
+    monkeypatch.setitem(generation_tasks._TASK_EXECUTORS, task_type, fake_executor)
+    monkeypatch.setattr(generation_tasks, "emit_generation_success_batch", lambda **_kwargs: None)
+
+    result = await generation_tasks.execute_generation_task(
+        {
+            "task_type": task_type,
+            "project_name": "demo",
+            "resource_id": "resource-1",
+            "payload": {"prompt": "p"},
+            "user_id": "user-1",
+            "task_id": "queue-task-1",
+            "credential_id": 123,
+        }
+    )
+
+    assert result == {"ok": True}
+    assert seen == {
+        "project_name": "demo",
+        "resource_id": "resource-1",
+        "payload": {"prompt": "p"},
+        "user_id": "user-1",
+        "task_id": "queue-task-1",
+        "credential_id": 123,
+    }
+
+
+@pytest.mark.asyncio
+async def test_reference_video_proxy_passes_credential_id(monkeypatch):
+    from server.services import reference_video_tasks
+    from server.services.generation_tasks import _execute_reference_video_task_proxy
+
+    seen: dict[str, object] = {}
+
+    async def fake_reference_video_task(
+        project_name, resource_id, payload, *, user_id, task_id=None, credential_id=None
+    ):
+        seen.update(
+            {
+                "project_name": project_name,
+                "resource_id": resource_id,
+                "payload": payload,
+                "user_id": user_id,
+                "task_id": task_id,
+                "credential_id": credential_id,
+            }
+        )
+        return {"ok": True}
+
+    monkeypatch.setattr(reference_video_tasks, "execute_reference_video_task", fake_reference_video_task)
+
+    result = await _execute_reference_video_task_proxy(
+        "demo",
+        "E1U01",
+        {"script_file": "episode_1.json"},
+        user_id="user-1",
+        task_id="queue-task-1",
+        credential_id=321,
+    )
+
+    assert result == {"ok": True}
+    assert seen == {
+        "project_name": "demo",
+        "resource_id": "E1U01",
+        "payload": {"script_file": "episode_1.json"},
+        "user_id": "user-1",
+        "task_id": "queue-task-1",
+        "credential_id": 321,
+    }
+
+
+@pytest.mark.asyncio
 async def test_execute_generation_task_translates_image_endpoint_mismatch(monkeypatch):
     from server.services.generation_tasks import execute_generation_task
 

@@ -57,8 +57,8 @@ pm = ProjectManager(app_data_dir())
 rate_limiter = get_shared_rate_limiter()
 logger = logging.getLogger(__name__)
 
-# 按 (channel, provider_name, model) 缓存 Backend 实例，避免每次任务重建 API 客户端
-_backend_cache: dict[tuple[str, str, str | None], Any] = {}
+# 按 (channel, provider_name, model, credential_id) 缓存 Backend 实例，避免每次任务重建 API 客户端
+_backend_cache: dict[tuple[str, str, str | None, int | None], Any] = {}
 
 
 def get_project_manager() -> ProjectManager:
@@ -96,6 +96,7 @@ async def _get_or_create_video_backend(
     resolver: ConfigResolver,
     *,
     default_video_model: str | None = None,
+    credential_id: int | None = None,
 ):
     """获取或创建 VideoBackend 实例（带缓存）。
 
@@ -104,7 +105,7 @@ async def _get_or_create_video_backend(
     default_video_model: 全局默认视频模型，当 provider_settings 中无 model 时作为 fallback。
     """
     effective_model = provider_settings.get("model") or default_video_model or None
-    cache_key = ("video", provider_name, effective_model)
+    cache_key = ("video", provider_name, effective_model, credential_id)
     if cache_key in _backend_cache:
         return _backend_cache[cache_key]
 
@@ -114,6 +115,7 @@ async def _get_or_create_video_backend(
         model_id=effective_model,
         resolver=resolver,
         rate_limiter=rate_limiter,
+        credential_id=credential_id,
     )
     _backend_cache[cache_key] = backend
     return backend
@@ -125,10 +127,11 @@ async def _get_or_create_image_backend(
     resolver: ConfigResolver,
     *,
     default_image_model: str | None = None,
+    credential_id: int | None = None,
 ):
     """获取或创建 ImageBackend 实例（带缓存）。"""
     effective_model = provider_settings.get("model") or default_image_model or None
-    cache_key = ("image", provider_name, effective_model)
+    cache_key = ("image", provider_name, effective_model, credential_id)
     if cache_key in _backend_cache:
         return _backend_cache[cache_key]
 
@@ -138,6 +141,7 @@ async def _get_or_create_image_backend(
         model_id=effective_model,
         resolver=resolver,
         rate_limiter=rate_limiter,
+        credential_id=credential_id,
     )
     _backend_cache[cache_key] = backend
     return backend
@@ -149,10 +153,11 @@ async def _get_or_create_audio_backend(
     resolver: ConfigResolver,
     *,
     default_audio_model: str | None = None,
+    credential_id: int | None = None,
 ):
     """获取或创建 AudioBackend 实例（带缓存）。"""
     effective_model = provider_settings.get("model") or default_audio_model or None
-    cache_key = ("audio", provider_name, effective_model)
+    cache_key = ("audio", provider_name, effective_model, credential_id)
     if cache_key in _backend_cache:
         return _backend_cache[cache_key]
 
@@ -163,6 +168,7 @@ async def _get_or_create_audio_backend(
         model_id=effective_model,
         resolver=resolver,
         rate_limiter=rate_limiter,
+        credential_id=credential_id,
     )
     _backend_cache[cache_key] = backend
     return backend
@@ -172,6 +178,8 @@ async def _resolve_video_backend(
     project_name: str,
     resolver: ConfigResolver,
     payload: dict | None,
+    *,
+    credential_id: int | None = None,
 ) -> tuple[Any | None, str]:
     """解析并构造视频后端，返回 (video_backend, provider_id)。
 
@@ -190,6 +198,7 @@ async def _resolve_video_backend(
             provider_settings,
             resolver,
             default_video_model=resolved.model_id or None,
+            credential_id=credential_id,
         )
 
     return video_backend, resolved.provider_id
@@ -203,6 +212,7 @@ async def get_media_generator(
     require_image_backend: bool = True,
     needs_i2i: bool = False,
     needs_audio: bool = False,
+    credential_id: int | None = None,
 ) -> MediaGenerator:
     """创建 MediaGenerator。仅按调用场景初始化所需的 backend。
 
@@ -233,6 +243,7 @@ async def get_media_generator(
                 {},
                 r,
                 default_audio_model=resolved_audio.model_id or None,
+                credential_id=credential_id,
             )
         else:
             if require_image_backend:
@@ -245,6 +256,7 @@ async def get_media_generator(
                     {},
                     r,
                     default_image_model=resolved_image.model_id or None,
+                    credential_id=credential_id,
                 )
 
             # 解析 video backend（保持现有逻辑）
@@ -252,6 +264,7 @@ async def get_media_generator(
                 project_name,
                 r,
                 payload,
+                credential_id=credential_id,
             )
 
     return MediaGenerator(
@@ -264,6 +277,7 @@ async def get_media_generator(
         user_id=user_id,
         image_provider_id=image_provider_id,
         video_provider_id=video_provider_id,
+        video_credential_id=credential_id,
     )
 
 
@@ -776,6 +790,7 @@ async def execute_storyboard_task(
     *,
     user_id: str = DEFAULT_USER_ID,
     task_id: str | None = None,
+    credential_id: int | None = None,
 ) -> dict[str, Any]:
     script_file = payload.get("script_file")
     if not script_file:
@@ -824,6 +839,7 @@ async def execute_storyboard_task(
         payload=payload,
         user_id=user_id,
         needs_i2i=_needs_i2i,
+        credential_id=credential_id,
     )
     aspect_ratio = get_aspect_ratio(project, "storyboards")
 
@@ -867,6 +883,7 @@ async def execute_tts_task(
     *,
     user_id: str = DEFAULT_USER_ID,
     task_id: str | None = None,
+    credential_id: int | None = None,
 ) -> dict[str, Any]:
     """为说书模式单个 segment 合成旁白音频（同步 TTS，无续传）。
 
@@ -900,6 +917,7 @@ async def execute_tts_task(
         user_id=user_id,
         require_image_backend=False,
         needs_audio=True,
+        credential_id=credential_id,
     )
 
     from lib.config.resolver import ConfigResolver
@@ -947,6 +965,7 @@ async def execute_video_task(
     *,
     user_id: str = DEFAULT_USER_ID,
     task_id: str | None = None,
+    credential_id: int | None = None,
 ) -> dict[str, Any]:
     script_file = payload.get("script_file")
     if not script_file:
@@ -967,7 +986,7 @@ async def execute_video_task(
         return _project, _project_path, _item
 
     project, project_path, item = await asyncio.to_thread(_load)
-    generator = await get_media_generator(project_name, payload=payload, user_id=user_id)
+    generator = await get_media_generator(project_name, payload=payload, user_id=user_id, credential_id=credential_id)
 
     # 优先读取 generated_assets.storyboard_image，回退默认路径。
     # 旧宫格项目 storyboard_image 指向 scene_{id}_first.png，仍可正常解析。
@@ -1139,6 +1158,7 @@ async def execute_character_task(
     *,
     user_id: str = DEFAULT_USER_ID,
     task_id: str | None = None,
+    credential_id: int | None = None,
 ) -> dict[str, Any]:
     prompt = str(payload.get("prompt", "") or "").strip()
     if not prompt:
@@ -1164,7 +1184,9 @@ async def execute_character_task(
     project, full_prompt, reference_images = await asyncio.to_thread(_prepare_char)
     _needs_i2i = bool(reference_images)
 
-    generator = await get_media_generator(project_name, payload=payload, user_id=user_id, needs_i2i=_needs_i2i)
+    generator = await get_media_generator(
+        project_name, payload=payload, user_id=user_id, needs_i2i=_needs_i2i, credential_id=credential_id
+    )
     aspect_ratio = get_aspect_ratio(project, "characters")
 
     resolved_image = await _resolve_effective_image_backend(project, payload, needs_i2i=_needs_i2i)
@@ -1238,6 +1260,7 @@ async def execute_design_task(
     payload: dict[str, Any],
     *,
     user_id: str = DEFAULT_USER_ID,
+    credential_id: int | None = None,
 ) -> dict[str, Any]:
     """合并 execute_scene_task / execute_prop_task / execute_product_task：按 kind 查表派发。"""
     spec = ASSET_SPECS[kind]
@@ -1263,7 +1286,9 @@ async def execute_design_task(
     project, full_prompt, reference_images = await asyncio.to_thread(_prepare)
     needs_i2i = bool(reference_images)
 
-    generator = await get_media_generator(project_name, payload=payload, user_id=user_id, needs_i2i=needs_i2i)
+    generator = await get_media_generator(
+        project_name, payload=payload, user_id=user_id, needs_i2i=needs_i2i, credential_id=credential_id
+    )
     aspect_ratio = get_aspect_ratio(project, bucket_key)
 
     resolved_image = await _resolve_effective_image_backend(project, payload, needs_i2i=needs_i2i)
@@ -1302,8 +1327,11 @@ async def execute_scene_task(
     *,
     user_id: str = DEFAULT_USER_ID,
     task_id: str | None = None,
+    credential_id: int | None = None,
 ) -> dict[str, Any]:
-    return await execute_design_task("scene", project_name, resource_id, payload, user_id=user_id)
+    return await execute_design_task(
+        "scene", project_name, resource_id, payload, user_id=user_id, credential_id=credential_id
+    )
 
 
 async def execute_prop_task(
@@ -1313,8 +1341,11 @@ async def execute_prop_task(
     *,
     user_id: str = DEFAULT_USER_ID,
     task_id: str | None = None,
+    credential_id: int | None = None,
 ) -> dict[str, Any]:
-    return await execute_design_task("prop", project_name, resource_id, payload, user_id=user_id)
+    return await execute_design_task(
+        "prop", project_name, resource_id, payload, user_id=user_id, credential_id=credential_id
+    )
 
 
 async def execute_product_task(
@@ -1324,8 +1355,11 @@ async def execute_product_task(
     *,
     user_id: str = DEFAULT_USER_ID,
     task_id: str | None = None,
+    credential_id: int | None = None,
 ) -> dict[str, Any]:
-    return await execute_design_task("product", project_name, resource_id, payload, user_id=user_id)
+    return await execute_design_task(
+        "product", project_name, resource_id, payload, user_id=user_id, credential_id=credential_id
+    )
 
 
 def _group_scenes_by_segment_break(items: list[dict], id_field: str) -> list[list[dict]]:
@@ -1418,6 +1452,7 @@ async def execute_grid_task(
     *,
     user_id: str = DEFAULT_USER_ID,
     task_id: str | None = None,
+    credential_id: int | None = None,
 ) -> dict[str, Any]:
     """Execute a grid image generation task.
 
@@ -1469,6 +1504,7 @@ async def execute_grid_task(
             payload=payload,
             user_id=user_id,
             needs_i2i=_needs_i2i,
+            credential_id=credential_id,
         )
 
         project = await asyncio.to_thread(get_project_manager().load_project, project_name)
@@ -1603,11 +1639,14 @@ async def _execute_reference_video_task_proxy(
     *,
     user_id: str,
     task_id: str | None = None,
+    credential_id: int | None = None,
 ) -> dict[str, Any]:
     """Lazy proxy to avoid circular import: reference_video_tasks imports from this module."""
     from server.services.reference_video_tasks import execute_reference_video_task
 
-    return await execute_reference_video_task(project_name, resource_id, payload, user_id=user_id, task_id=task_id)
+    return await execute_reference_video_task(
+        project_name, resource_id, payload, user_id=user_id, task_id=task_id, credential_id=credential_id
+    )
 
 
 _TASK_EXECUTORS = {
@@ -1630,6 +1669,7 @@ async def execute_generation_task(task: dict[str, Any]) -> dict[str, Any]:
     payload = task.get("payload") or {}
     user_id = task.get("user_id", DEFAULT_USER_ID)
     queue_task_id = task.get("task_id")
+    credential_id = task.get("credential_id")
 
     if not project_name:
         raise ValueError("task.project_name is required")
@@ -1642,7 +1682,14 @@ async def execute_generation_task(task: dict[str, Any]) -> dict[str, Any]:
 
     with project_change_source("worker"):
         try:
-            result = await executor(project_name, resource_id, payload, user_id=user_id, task_id=queue_task_id)
+            result = await executor(
+                project_name,
+                resource_id,
+                payload,
+                user_id=user_id,
+                task_id=queue_task_id,
+                credential_id=credential_id,
+            )
         except (ImageCapabilityError, VideoCapabilityError, ReferencePayloadFloorError) as err:
             # Worker 后台无 request 上下文，按 DEFAULT_LOCALE 渲染稳定的 i18n 文案
             # 落到 task.error_message，前端轮询时即可看到本地化提示。

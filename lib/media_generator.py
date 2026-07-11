@@ -80,6 +80,7 @@ class MediaGenerator:
         user_id: str = DEFAULT_USER_ID,
         image_provider_id: str | None = None,
         video_provider_id: str | None = None,
+        video_credential_id: int | None = None,
     ):
         """
         初始化 MediaGenerator
@@ -106,6 +107,7 @@ class MediaGenerator:
         self._user_id = user_id
         self._image_provider_id = image_provider_id
         self._video_provider_id = video_provider_id
+        self._video_credential_id = video_credential_id
         self.versions = VersionManager(project_path)
 
         # 初始化 UsageTracker（使用全局 async session factory）
@@ -694,6 +696,8 @@ class MediaGenerator:
                         generate_audio=effective_generate_audio,
                         project_name=self.project_name,
                         task_id=task_id,
+                        credential_id=getattr(self, "_video_credential_id", None),
+                        model_id=model_name,
                         service_tier=version_metadata.get("service_tier", "default"),
                         seed=version_metadata.get("seed"),
                     )
@@ -802,6 +806,8 @@ class MediaGenerator:
             generate_audio=effective_generate_audio,
             project_name=self.project_name,
             task_id=task_id,
+            credential_id=getattr(self, "_video_credential_id", None),
+            model_id=getattr(self._video_backend, "model", None),
             service_tier=version_metadata.get("service_tier", "default"),
             seed=version_metadata.get("seed"),
         )

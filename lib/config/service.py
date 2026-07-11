@@ -30,6 +30,11 @@ _DEFAULT_REFERENCE_SINGLE_MAX_BYTES = 4 * 1024 * 1024
 # 其余 number 字段（image_rpm / video_rpm / request_gap）语义不同（允许小数），不在此列。
 _MAX_WORKERS_KEYS = frozenset({"image_max_workers", "video_max_workers", "audio_max_workers"})
 _MAX_WORKERS_CODE = "max_workers_must_be_positive_integer"
+_CREDENTIAL_POOL_ENABLED_KEY = "credential_pool_enabled"
+_CREDENTIAL_POOL_CONCURRENCY_MODE_KEY = "credential_pool_concurrency_mode"
+_CREDENTIAL_POOL_CONCURRENCY_MODES = frozenset({"shared", "separate"})
+_CREDENTIAL_POOL_ENABLED_CODE = "credential_pool_enabled_must_be_boolean"
+_CREDENTIAL_POOL_CONCURRENCY_MODE_CODE = "credential_pool_concurrency_mode_invalid"
 
 
 class ProviderConfigValueError(ValueError):
@@ -130,6 +135,10 @@ class ConfigService:
     ) -> None:
         self._validate_provider(provider)
         self._validate_value(provider, key, value)
+        if key == _CREDENTIAL_POOL_ENABLED_KEY:
+            value = self._canonicalize_bool_config(provider, key, value)
+        elif key == _CREDENTIAL_POOL_CONCURRENCY_MODE_KEY:
+            value = value.strip().lower()
         if key in _MAX_WORKERS_KEYS:
             # 入库统一规范化为 ASCII 数字串（int() 接受 " 5 " / "+5" / "1_0" / 全角数字等
             # 非规范形态），保证任何读取方拿到的都是可直接解析、可在 number 输入框回显的值
@@ -268,6 +277,9 @@ class ConfigService:
         静默失效，因此在写入口拦下。
         """
         if key not in _MAX_WORKERS_KEYS:
+            if key == _CREDENTIAL_POOL_CONCURRENCY_MODE_KEY:
+                if value.strip().lower() not in _CREDENTIAL_POOL_CONCURRENCY_MODES:
+                    raise ProviderConfigValueError(provider, key, value, code=_CREDENTIAL_POOL_CONCURRENCY_MODE_CODE)
             return
         try:
             parsed = int(value)
@@ -275,6 +287,15 @@ class ConfigService:
             raise ProviderConfigValueError(provider, key, value, code=_MAX_WORKERS_CODE) from None
         if parsed < 1:
             raise ProviderConfigValueError(provider, key, value, code=_MAX_WORKERS_CODE)
+
+    @staticmethod
+    def _canonicalize_bool_config(provider: str, key: str, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return "true"
+        if normalized in {"false", "0", "no", "off"}:
+            return "false"
+        raise ProviderConfigValueError(provider, key, value, code=_CREDENTIAL_POOL_ENABLED_CODE)
 
     @staticmethod
     def _parse_backend(raw: str, fallback: str) -> tuple[str, str]:

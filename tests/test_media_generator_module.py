@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -121,6 +122,7 @@ def _build_generator(tmp_path: Path) -> MediaGenerator:
     gen._config = _FakeConfigResolver()
     gen._image_provider_id = None
     gen._video_provider_id = None
+    gen._video_credential_id = None
     gen.versions = _FakeVersions()
     gen.usage_tracker = _FakeUsage()
     return gen
@@ -199,6 +201,24 @@ class TestMediaGenerator:
         )
         assert gen.usage_tracker.started[-1]["duration_seconds"] == 6
         assert gen.usage_tracker.finished[-1]["billed_duration_seconds"] == 15
+
+    @pytest.mark.asyncio
+    async def test_generate_video_request_carries_credential_and_model(self, tmp_path):
+        gen = _build_generator(tmp_path)
+        gen._video_credential_id = 321
+
+        with patch("lib.video_backends.base.persist_api_call_id", new=AsyncMock()):
+            await gen.generate_video_async(
+                prompt="p",
+                resource_type="videos",
+                resource_id="E1S11",
+                task_id="task-cred",
+            )
+
+        request = gen._video_backend.calls[-1]
+        assert request.task_id == "task-cred"
+        assert request.credential_id == 321
+        assert request.model_id == "video-model"
 
     @pytest.mark.asyncio
     async def test_video_billed_duration_lands_in_ledger(self, tmp_path):

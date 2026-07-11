@@ -1,6 +1,7 @@
 """Tests for GenerationQueue (async wrapper over TaskRepository)."""
 
 import asyncio
+import logging
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -315,6 +316,138 @@ class TestGenerationQueue:
         task = await queue.get_task(enqueued["task_id"])
         assert task is not None
         assert task["provider_job_id"] == "job-abc-123"
+
+    async def test_provider_job_binding_lookup_wrappers(self, queue):
+        enqueued = await queue.enqueue_task(
+            project_name="demo",
+            task_type="video",
+            media_type="video",
+            resource_id="r1",
+            payload={},
+            script_file="ep1.json",
+        )
+        await queue.persist_provider_job_binding(
+            task_id=enqueued["task_id"],
+            provider="openai",
+            provider_job_id="job-bind-1",
+            credential_id=42,
+            media_type="video",
+            model_id="sora-2",
+        )
+
+        by_task = await queue.get_provider_job_binding_by_task(enqueued["task_id"])
+        by_job = await queue.get_provider_job_binding(provider="openai", provider_job_id="job-bind-1")
+
+        assert by_task == by_job
+        assert by_task is not None
+        assert by_task["provider"] == "openai"
+        assert by_task["provider_job_id"] == "job-bind-1"
+        assert by_task["credential_id"] == 42
+        assert by_task["media_type"] == "video"
+        assert by_task["model_id"] == "sora-2"
+
+    async def test_credential_wait_wrappers(self, queue):
+        enqueued = await queue.enqueue_task(
+            project_name="demo",
+            task_type="storyboard",
+            media_type="image",
+            resource_id="r1",
+            payload={},
+            script_file="ep1.json",
+            provider_id="gemini-aistudio",
+        )
+
+        assert await queue.mark_waiting_for_credential("gemini-aistudio", "image") == 1
+        marked = await queue.get_task(enqueued["task_id"])
+        assert marked["wait_reason"] == "waiting_for_credential"
+        await queue.clear_wait_reason(enqueued["task_id"])
+        cleared = await queue.get_task(enqueued["task_id"])
+        assert cleared["wait_reason"] is None
+
+    async def test_requeue_for_credential_wait_wrapper(self, queue):
+        enqueued = await queue.enqueue_task(
+            project_name="demo",
+            task_type="storyboard",
+            media_type="image",
+            resource_id="r1",
+            payload={},
+            script_file="ep1.json",
+        )
+        await queue.claim_next_task("image")
+
+        assert await queue.requeue_for_credential_wait(enqueued["task_id"], "waiting_for_credential") == 1
+        task = await queue.get_task(enqueued["task_id"])
+        assert task["status"] == "queued"
+        assert task["wait_reason"] == "waiting_for_credential"
+
+    async def test_bind_active_credential_for_task_wrapper(self, queue):
+        from lib.db.repositories.credential_repository import CredentialRepository
+
+        async with queue._session_factory() as session:
+            credential = await CredentialRepository(session).create("gemini-aistudio", "active", api_key="k")
+            await session.commit()
+
+        enqueued = await queue.enqueue_task(
+            project_name="demo",
+            task_type="video",
+            media_type="video",
+            resource_id="r1",
+            payload={},
+            script_file="ep1.json",
+            provider_id="gemini-aistudio",
+        )
+        await queue.claim_next_task("video")
+
+        bound_id = await queue.bind_active_credential_for_task(
+            task_id=enqueued["task_id"],
+            provider="gemini-aistudio",
+        )
+        task = await queue.get_task(enqueued["task_id"])
+
+        assert bound_id == credential.id
+        assert task["credential_id"] == credential.id
+
+    async def test_credential_observability_logs_masked_secret_tail(self, queue, caplog):
+        from lib.config.service import ConfigService
+        from lib.db.repositories.credential_repository import CredentialRepository
+
+        async with queue._session_factory() as session:
+            svc = ConfigService(session)
+            await svc.set_provider_config("gemini-aistudio", "credential_pool_enabled", "true")
+            credential = await CredentialRepository(session).create(
+                "gemini-aistudio",
+                "pool key",
+                api_key="AIzaSySECRET1234",
+                is_enabled=True,
+            )
+            await session.commit()
+
+        enqueued = await queue.enqueue_task(
+            project_name="demo",
+            task_type="storyboard",
+            media_type="image",
+            resource_id="r1",
+            payload={},
+            script_file="ep1.json",
+            provider_id="gemini-aistudio",
+        )
+        await queue.claim_next_task("image")
+
+        with caplog.at_level(logging.INFO, logger="lib.generation_queue"):
+            result = await queue.acquire_credential_lease(
+                provider="gemini-aistudio",
+                media_type="image",
+                task_id=enqueued["task_id"],
+                owner_id="worker-1",
+            )
+
+        assert result.acquired is True
+        assert result.credential_id == credential.id
+        assert "凭证租赁成功" in caplog.text
+        assert "credential_id=" in caplog.text
+        assert "name=pool key" in caplog.text
+        assert "api_key=****1234" in caplog.text
+        assert "AIzaSySECRET1234" not in caplog.text
 
     async def test_mark_task_cancelled_wrapper(self, queue):
         """mark_task_cancelled wrapper → repo.finalize_cancelled,SQL 守卫接住 queued/cancelling/running。"""

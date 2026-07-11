@@ -192,6 +192,38 @@ async def test_execute_resume_passes_require_image_backend_false(monkeypatch, fa
     await execute_resume_video_task(video_task, job_id="openai-job-1")
 
     assert captured["kwargs"].get("require_image_backend") is False
+    assert captured["kwargs"].get("credential_id") is None
+
+
+@pytest.mark.asyncio
+async def test_execute_resume_passes_bound_credential_id(monkeypatch, fake_pm, video_task):
+    """resume executor 应把 worker 注入的 binding credential_id 传给 MediaGenerator。"""
+    from server.services import resume_executor
+    from server.services.resume_executor import execute_resume_video_task
+
+    fake_gen = _FakeGenerator()
+    monkeypatch.setattr(resume_executor, "get_project_manager", lambda: fake_pm)
+    monkeypatch.setattr("server.services.generation_tasks.get_project_manager", lambda: fake_pm)
+    monkeypatch.setattr("server.services.reference_video_tasks.get_project_manager", lambda: fake_pm)
+
+    async def _fake_thumb(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr("server.services.generation_tasks.extract_video_thumbnail", _fake_thumb)
+    monkeypatch.setattr("server.services.reference_video_tasks.extract_video_thumbnail", _fake_thumb)
+
+    captured: dict[str, Any] = {}
+
+    async def _capturing_get_media_generator(*args: Any, **kwargs: Any) -> Any:
+        captured["kwargs"] = kwargs
+        return fake_gen
+
+    monkeypatch.setattr(resume_executor, "get_media_generator", _capturing_get_media_generator)
+    task = {**video_task, "credential_id": 123}
+
+    await execute_resume_video_task(task, job_id="openai-job-1")
+
+    assert captured["kwargs"].get("credential_id") == 123
 
 
 @pytest.mark.asyncio

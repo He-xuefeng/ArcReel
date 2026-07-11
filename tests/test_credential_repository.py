@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -172,3 +174,57 @@ class TestCredentialRepository:
         )
         await session.flush()
         assert c.base_url == "https://proxy.example.com/v1/"
+
+    async def test_create_defaults_to_not_enabled_for_pooling(self, session: AsyncSession):
+        repo = CredentialRepository(session)
+        c = await repo.create(provider="gemini-aistudio", name="Key", api_key="AIza-1")
+        await session.flush()
+        assert c.is_enabled is False
+        assert c.last_leased_at is None
+
+    async def test_create_and_update_is_enabled(self, session: AsyncSession):
+        repo = CredentialRepository(session)
+        c = await repo.create(provider="gemini-aistudio", name="Key", api_key="AIza-1", is_enabled=True)
+        await session.flush()
+        assert c.is_enabled is True
+
+        await repo.update(c.id, is_enabled=False)
+        await session.flush()
+        updated = await repo.get_by_id(c.id)
+        assert updated is not None
+        assert updated.is_enabled is False
+
+    async def test_get_by_id_for_provider_validates_ownership(self, session: AsyncSession):
+        repo = CredentialRepository(session)
+        c = await repo.create(provider="gemini-aistudio", name="Key", api_key="AIza-1")
+        await session.flush()
+
+        assert await repo.get_by_id_for_provider("gemini-aistudio", c.id) is not None
+        assert await repo.get_by_id_for_provider("ark", c.id) is None
+
+    async def test_list_enabled_by_provider_filters_and_orders_for_pooling(self, session: AsyncSession):
+        repo = CredentialRepository(session)
+        older = datetime(2026, 1, 1, tzinfo=UTC)
+        newer = older + timedelta(hours=1)
+        c1 = await repo.create(provider="gemini-aistudio", name="never leased", api_key="AIza-1", is_enabled=True)
+        c2 = await repo.create(provider="gemini-aistudio", name="older", api_key="AIza-2", is_enabled=True)
+        c3 = await repo.create(provider="gemini-aistudio", name="disabled", api_key="AIza-3", is_enabled=False)
+        c4 = await repo.create(provider="gemini-aistudio", name="newer", api_key="AIza-4", is_enabled=True)
+        await repo.create(provider="ark", name="other provider", api_key="ark-key", is_enabled=True)
+        c2.last_leased_at = older
+        c3.last_leased_at = older
+        c4.last_leased_at = newer
+        await session.flush()
+
+        enabled = await repo.list_enabled_by_provider("gemini-aistudio")
+        assert [c.id for c in enabled] == [c1.id, c2.id, c4.id]
+
+    async def test_touch_last_leased(self, session: AsyncSession):
+        repo = CredentialRepository(session)
+        c = await repo.create(provider="gemini-aistudio", name="Key", api_key="AIza-1", is_enabled=True)
+        leased_at = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+
+        await repo.touch_last_leased(c.id, leased_at)
+        await session.flush()
+        await session.refresh(c)
+        assert c.last_leased_at == leased_at.replace(tzinfo=None)

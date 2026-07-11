@@ -31,11 +31,17 @@ export interface ProviderField {
   placeholder?: string;
 }
 
-// 凭证表单需渲染的 secret 输入字段（后端按 required ∩ secret ∩ 凭证键派生，单一真相源）。
-// 单 secret provider → [api_key]；可灵 → [access_key, secret_key]。
+// 凭证表单需要渲染的 secret 输入字段，由后端 registry 派生。
 export interface CredentialSecretField {
   key: string;
   label: string;
+}
+
+export type CredentialPoolConcurrencyMode = "shared" | "separate";
+
+export interface CredentialPoolSummary {
+  enabled_credentials_count: number;
+  active_lease_count: number;
 }
 
 export interface ProviderConfigDetail {
@@ -45,12 +51,14 @@ export interface ProviderConfigDetail {
   status: "ready" | "unconfigured" | "error";
   media_types?: string[];
   fields: ProviderField[];
-  // 凭证是否支持自定义 base_url（后端按 optional_keys 派生，单一真相源）
+  credential_pool_enabled: boolean;
+  credential_pool_concurrency_mode: CredentialPoolConcurrencyMode;
+  credential_pool_summary: CredentialPoolSummary;
+  // 凭证是否支持自定义 base_url，后端按 optional_keys 派生。
   supports_base_url: boolean;
-  // 凭证表单应渲染的 secret 字段（有序）
+  // 凭证表单应渲染的 secret 字段，有序。
   secret_fields: CredentialSecretField[];
-  // 凭证「二选一」分组：满足任一组（组内字段全填）即视为凭证完整；单组场景（绝大多数
-  // provider）等价于「全部 secret_fields 必填」的旧语义。可灵为 [["api_key"], ["access_key", "secret_key"]]。
+  // 凭证“二选一”分组：满足任一组即视为凭证完整。
   secret_field_groups: string[][];
 }
 
@@ -67,10 +75,12 @@ export interface ProviderCredential {
   api_key_masked: string | null;
   credentials_filename: string | null;
   base_url: string | null;
-  // 逐字段独立脱敏的双 secret（可灵）；其余 provider 为 null/缺省
+  // 逐字段脱敏的可选 secret，其它 provider 可为 null 或缺省。
   access_key_masked?: string | null;
   secret_key_masked?: string | null;
   is_active: boolean;
+  is_enabled: boolean;
+  active_lease_count: number;
   created_at: string;
 }
 

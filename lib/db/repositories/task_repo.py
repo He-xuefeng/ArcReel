@@ -14,6 +14,8 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 from lib.db.base import DEFAULT_USER_ID, dt_to_iso, utc_now
+from lib.db.models.credential import ProviderCredential
+from lib.db.models.credential_pool import ProviderJobBinding
 from lib.db.models.task import Task, TaskEvent, WorkerLease
 from lib.db.repositories.base import BaseRepository, rowcount
 
@@ -54,12 +56,33 @@ def _task_to_dict(row: Task) -> dict[str, Any]:
         "cancelled_by": row.cancelled_by,
         "provider_id": row.provider_id,
         "provider_job_id": row.provider_job_id,
+        "credential_id": row.credential_id,
+        "wait_reason": row.wait_reason,
         "queued_at": dt_to_iso(row.queued_at),
         "started_at": dt_to_iso(row.started_at),
         "finished_at": dt_to_iso(row.finished_at),
         "updated_at": dt_to_iso(row.updated_at),
         "user_id": row.user_id,
     }
+
+
+def _task_with_credential_to_dict(row: Task, credential: ProviderCredential | None) -> dict[str, Any]:
+    data = _task_to_dict(row)
+    if credential is None:
+        data["credential_name"] = None
+        data["credential_label"] = None
+        return data
+    secret_tail = next(
+        (
+            value.strip()[-4:]
+            for value in (credential.api_key, credential.access_key, credential.secret_key, credential.credentials_path)
+            if isinstance(value, str) and value.strip()
+        ),
+        "",
+    )
+    data["credential_name"] = credential.name
+    data["credential_label"] = f"{credential.name} / ****{secret_tail}" if secret_tail else credential.name
+    return data
 
 
 def _event_to_dict(row: TaskEvent) -> dict[str, Any]:
@@ -242,6 +265,7 @@ class TaskRepository(BaseRepository):
             .values(
                 status="running",
                 started_at=now,
+                wait_reason=None,
                 updated_at=now,
             )
         )
@@ -651,6 +675,111 @@ class TaskRepository(BaseRepository):
                 skipped_terminal=skipped_terminal,
             )
 
+    async def requeue_for_credential_wait(self, task_id: str, reason: str) -> int:
+        """Move a running task back to queued because no credential is currently available."""
+        now = utc_now()
+        result = await self.session.execute(
+            update(Task)
+            .where(Task.task_id == task_id, Task.status == "running")
+            .values(
+                status="queued",
+                started_at=None,
+                wait_reason=reason,
+                updated_at=now,
+            )
+        )
+        affected = rowcount(result)
+        if affected == 0:
+            return 0
+        await self.session.flush()
+        res = await self.session.execute(select(Task).where(Task.task_id == task_id))
+        task = res.scalar_one()
+        await self._append_event(
+            task_id=task_id,
+            project_name=task.project_name,
+            event_type="requeued",
+            status="queued",
+            data=_task_to_dict(task),
+        )
+        await self.session.commit()
+        return affected
+
+    async def mark_waiting_for_credential(self, provider_id: str, media_type: str, limit: int = 200) -> int:
+        limit = max(1, min(limit, 1000))
+        rows = await self.session.execute(
+            select(Task.task_id)
+            .where(
+                Task.status == "queued",
+                Task.provider_id == provider_id,
+                Task.media_type == media_type,
+                (Task.wait_reason.is_(None) | (Task.wait_reason != "waiting_for_credential")),
+            )
+            .order_by(Task.queued_at.asc())
+            .limit(limit)
+        )
+        task_ids = [row[0] for row in rows.all()]
+        if not task_ids:
+            return 0
+        result = await self.session.execute(
+            update(Task)
+            .where(Task.task_id.in_(task_ids), Task.status == "queued")
+            .values(wait_reason="waiting_for_credential", updated_at=utc_now())
+        )
+        await self.session.commit()
+        return rowcount(result)
+
+    async def clear_wait_reason(self, task_id: str) -> None:
+        await self.session.execute(
+            update(Task).where(Task.task_id == task_id).values(wait_reason=None, updated_at=utc_now())
+        )
+        await self.session.commit()
+
+    async def persist_provider_job_binding(
+        self,
+        *,
+        task_id: str,
+        provider: str,
+        provider_job_id: str,
+        credential_id: int,
+        media_type: str,
+        model_id: str | None,
+    ) -> None:
+        now = utc_now()
+        self.session.add(
+            ProviderJobBinding(
+                task_id=task_id,
+                provider=provider,
+                provider_job_id=provider_job_id,
+                credential_id=credential_id,
+                media_type=media_type,
+                model_id=model_id,
+            )
+        )
+        await self.session.execute(
+            update(Task)
+            .where(Task.task_id == task_id)
+            .values(provider_job_id=provider_job_id, credential_id=credential_id, updated_at=now)
+        )
+        await self.session.commit()
+
+    async def bind_active_credential_for_task(self, task_id: str, provider: str) -> int | None:
+        result = await self.session.execute(
+            select(ProviderCredential.id).where(
+                ProviderCredential.provider == provider,
+                ProviderCredential.is_active == True,  # noqa: E712
+            )
+        )
+        credential_id = result.scalar_one_or_none()
+        if credential_id is None:
+            return None
+        await self.session.execute(
+            update(Task)
+            .where(Task.task_id == task_id, Task.status == "running")
+            .values(credential_id=credential_id, updated_at=utc_now())
+        )
+        await self.session.commit()
+        return int(credential_id)
+
     async def persist_provider_job_id(self, task_id: str, job_id: str) -> None:
         """单独事务持久化 provider_job_id；不带 WHERE 状态守卫（worker 内调用，确定是 running）。
 
@@ -834,11 +963,18 @@ class TaskRepository(BaseRepository):
         return len(requeued_tasks)
 
     async def get(self, task_id: str) -> dict[str, Any] | None:
-        stmt = select(Task).where(Task.task_id == task_id)
+        stmt = (
+            select(Task, ProviderCredential)
+            .outerjoin(ProviderCredential, ProviderCredential.id == Task.credential_id)
+            .where(Task.task_id == task_id)
+        )
         stmt = self._scope_query(stmt, Task)
         result = await self.session.execute(stmt)
-        task = result.scalar_one_or_none()
-        return _task_to_dict(task) if task else None
+        row = result.one_or_none()
+        if row is None:
+            return None
+        task, credential = row
+        return _task_with_credential_to_dict(task, credential)
 
     async def list_tasks(
         self,
@@ -869,7 +1005,8 @@ class TaskRepository(BaseRepository):
         total = (await self.session.execute(count_stmt)).scalar() or 0
 
         items_stmt = (
-            select(Task)
+            select(Task, ProviderCredential)
+            .outerjoin(ProviderCredential, ProviderCredential.id == Task.credential_id)
             .where(*filters)
             .order_by(Task.updated_at.desc(), Task.queued_at.desc())
             .limit(page_size)
@@ -877,7 +1014,7 @@ class TaskRepository(BaseRepository):
         )
         items_stmt = self._scope_query(items_stmt, Task)
         result = await self.session.execute(items_stmt)
-        items = [_task_to_dict(t) for t in result.scalars().all()]
+        items = [_task_with_credential_to_dict(task, credential) for task, credential in result.all()]
 
         return {
             "items": items,

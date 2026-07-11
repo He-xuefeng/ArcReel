@@ -10,13 +10,43 @@ import asyncio
 import logging
 import threading
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from lib.db import safe_session_factory
 from lib.db.base import DEFAULT_USER_ID
+from lib.db.models.credential import ProviderCredential
+from lib.db.repositories.credential_pool_repository import CredentialLeaseResult, CredentialPoolRepository
+from lib.db.repositories.provider_job_binding_repository import ProviderJobBindingRepository
 from lib.db.repositories.task_repo import TaskRepository
 
 logger = logging.getLogger(__name__)
+
+
+def _secret_tail(value: str | None) -> str | None:
+    raw = value.strip() if value else ""
+    return f"****{raw[-4:]}" if raw else None
+
+
+def _credential_log_label(credential: ProviderCredential | None) -> str:
+    """Return a human-readable credential summary that never contains full secrets."""
+    if credential is None:
+        return "<missing>"
+
+    parts: list[str] = []
+    for key, value in (
+        ("api_key", credential.api_key),
+        ("access_key", credential.access_key),
+        ("secret_key", credential.secret_key),
+    ):
+        tail = _secret_tail(value)
+        if tail:
+            parts.append(f"{key}={tail}")
+    if credential.credentials_path:
+        parts.append(f"file={Path(credential.credentials_path).name}")
+    if credential.base_url:
+        parts.append("base_url=set")
+    return ", ".join(parts) if parts else "<no-secret-fields>"
 
 
 async def _derive_provider_id_for_enqueue(
@@ -147,6 +177,72 @@ class GenerationQueue:
             logger.debug("任务被领取 task_id=%s", task["task_id"])
         return task
 
+    async def find_full_credential_pool_providers(
+        self,
+        media_type: str,
+        providers: set[str] | None = None,
+    ) -> frozenset[str]:
+        async with self._session_factory() as session:
+            repo = CredentialPoolRepository(session)
+            full = await repo.find_full_providers(media_type, providers=providers)
+        return frozenset(full)
+
+    async def acquire_credential_lease(
+        self,
+        *,
+        provider: str,
+        media_type: str,
+        task_id: str,
+        owner_id: str,
+    ) -> CredentialLeaseResult:
+        async with self._session_factory() as session:
+            repo = CredentialPoolRepository(session)
+            result = await repo.acquire_lease(provider, media_type, task_id, owner_id)
+            if result.acquired:
+                credential = await session.get(ProviderCredential, result.credential_id)
+                logger.info(
+                    "凭证租赁成功 task_id=%s provider=%s media=%s credential_id=%s name=%s detail=%s mode=pool",
+                    task_id,
+                    provider,
+                    media_type,
+                    result.credential_id,
+                    credential.name if credential else "<missing>",
+                    _credential_log_label(credential),
+                )
+                await session.commit()
+        return result
+
+    async def bind_active_credential_for_task(self, *, task_id: str, provider: str) -> int | None:
+        async with self._session_factory() as session:
+            repo = TaskRepository(session)
+            credential_id = await repo.bind_active_credential_for_task(task_id, provider)
+            credential = await session.get(ProviderCredential, credential_id) if credential_id is not None else None
+            logger.info(
+                "绑定 active 凭证 task_id=%s provider=%s credential_id=%s name=%s detail=%s mode=active-fallback",
+                task_id,
+                provider,
+                credential_id,
+                credential.name if credential else "<none>",
+                _credential_log_label(credential),
+            )
+            return credential_id
+
+    async def release_credential_lease(self, *, task_id: str, reason: str) -> bool:
+        async with self._session_factory() as session:
+            repo = CredentialPoolRepository(session)
+            released = await repo.release_lease(task_id, reason)
+            if released:
+                await session.commit()
+        return released
+
+    async def recover_credential_leases(self, *, limit: int = 500) -> int:
+        async with self._session_factory() as session:
+            repo = CredentialPoolRepository(session)
+            recovered = await repo.recover_leases(limit=limit)
+            if recovered:
+                await session.commit()
+        return recovered
+
     async def requeue_running_tasks(self, *, limit: int = 1000) -> int:
         async with self._session_factory() as session:
             repo = TaskRepository(session)
@@ -164,6 +260,71 @@ class GenerationQueue:
         async with self._session_factory() as session:
             repo = TaskRepository(session)
             await repo.persist_provider_job_id(task_id, job_id)
+
+    async def requeue_for_credential_wait(self, task_id: str, reason: str) -> int:
+        async with self._session_factory() as session:
+            repo = TaskRepository(session)
+            return await repo.requeue_for_credential_wait(task_id, reason)
+
+    async def mark_waiting_for_credential(self, provider_id: str, media_type: str, limit: int = 200) -> int:
+        async with self._session_factory() as session:
+            repo = TaskRepository(session)
+            return await repo.mark_waiting_for_credential(provider_id, media_type, limit=limit)
+
+    async def clear_wait_reason(self, task_id: str) -> None:
+        async with self._session_factory() as session:
+            repo = TaskRepository(session)
+            await repo.clear_wait_reason(task_id)
+
+    async def persist_provider_job_binding(
+        self,
+        *,
+        task_id: str,
+        provider: str,
+        provider_job_id: str,
+        credential_id: int,
+        media_type: str,
+        model_id: str | None,
+    ) -> None:
+        async with self._session_factory() as session:
+            repo = TaskRepository(session)
+            await repo.persist_provider_job_binding(
+                task_id=task_id,
+                provider=provider,
+                provider_job_id=provider_job_id,
+                credential_id=credential_id,
+                media_type=media_type,
+                model_id=model_id,
+            )
+
+    @staticmethod
+    def _provider_job_binding_to_dict(binding: Any) -> dict[str, Any]:
+        return {
+            "id": binding.id,
+            "task_id": binding.task_id,
+            "provider": binding.provider,
+            "provider_job_id": binding.provider_job_id,
+            "credential_id": binding.credential_id,
+            "media_type": binding.media_type,
+            "model_id": binding.model_id,
+        }
+
+    async def get_provider_job_binding_by_task(self, task_id: str) -> dict[str, Any] | None:
+        async with self._session_factory() as session:
+            repo = ProviderJobBindingRepository(session)
+            binding = await repo.get_by_task(task_id)
+            return self._provider_job_binding_to_dict(binding) if binding is not None else None
+
+    async def get_provider_job_binding(
+        self,
+        *,
+        provider: str,
+        provider_job_id: str,
+    ) -> dict[str, Any] | None:
+        async with self._session_factory() as session:
+            repo = ProviderJobBindingRepository(session)
+            binding = await repo.get_by_provider_job(provider, provider_job_id)
+            return self._provider_job_binding_to_dict(binding) if binding is not None else None
 
     async def persist_api_call_id(self, task_id: str, call_id: int) -> None:
         async with self._session_factory() as session:

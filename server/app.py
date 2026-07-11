@@ -408,6 +408,7 @@ async def lifespan(app: FastAPI):
     from lib.generation_queue import get_generation_queue
 
     get_generation_queue().set_worker_cancel_callback(worker.request_cancel)
+    await worker.reload_limits()
     await worker.start()
     logger.info("GenerationWorker 已启动")
 

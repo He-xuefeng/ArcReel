@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Boolean, Index, String, Text, text
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, Index, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from lib.db.base import Base, TimestampMixin
@@ -14,6 +16,8 @@ class ProviderCredential(TimestampMixin, Base):
     __tablename__ = "provider_credential"
     __table_args__ = (
         Index("ix_provider_credential_provider", "provider"),
+        Index("ix_provider_credential_provider_enabled", "provider", "is_enabled"),
+        Index("ix_provider_credential_provider_last_leased", "provider", "last_leased_at", "id"),
         Index(
             "uq_provider_credential_one_active",
             "provider",
@@ -34,6 +38,8 @@ class ProviderCredential(TimestampMixin, Base):
     access_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     secret_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_leased_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def overlay_config(self, config: dict[str, str]) -> dict[str, str]:
         """将凭证字段合并到配置字典中，返回修改后的 config。

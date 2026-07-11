@@ -32,6 +32,7 @@ import type {
   ProviderConfigDetail,
   ProviderTestResult,
   ProviderCredential,
+  CredentialPoolConcurrencyMode,
   UsageStatsResponse,
   CustomProviderInfo,
   CustomProviderModelInfo,
@@ -77,7 +78,23 @@ export interface LoginResponse {
 
 /** Standard error response body from backend (mirrors FastAPI HTTPException detail). */
 export interface ErrorResponse {
-  detail: string | { msg?: string }[];
+  detail: string | { msg?: string }[] | { code?: string; message?: string };
+}
+
+export type ProviderConfigPatch = Record<string, string | boolean | null> & {
+  credential_pool_enabled?: boolean | string | null;
+  credential_pool_concurrency_mode?: CredentialPoolConcurrencyMode | null;
+};
+
+export class ApiError extends Error {
+  constructor(message: string, public readonly code?: string, public readonly status?: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+export function apiErrorCode(err: unknown): string | undefined {
+  return err instanceof ApiError ? err.code : undefined;
 }
 
 /**
@@ -273,6 +290,21 @@ function normalizeExportDiagnostics(value: unknown): ExportDiagnostics {
   };
 }
 
+function errorFromResponsePayload(payload: ErrorResponse, status: number): ApiError {
+  const detail = payload.detail;
+  let message = "请求失败";
+  let code: string | undefined;
+  if (typeof detail === "string") {
+    message = detail || message;
+  } else if (Array.isArray(detail) && detail.length > 0) {
+    message = detail.map((e) => (typeof e === "string" ? e : e?.msg)).filter(Boolean).join("; ") || message;
+  } else if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+    code = typeof detail.code === "string" ? detail.code : undefined;
+    message = typeof detail.message === "string" && detail.message ? detail.message : message;
+  }
+  return new ApiError(message, code, status);
+}
+
 // ==================== API class ====================
 
 const API_BASE = "/api/v1";
@@ -287,8 +319,8 @@ async function throwIfNotOk(response: Response, fallbackMsg: string): Promise<vo
     const error = await response
       .json()
       .catch(() => ({ detail: response.statusText })) as ErrorResponse;
-    const detail = error.detail;
-    throw new Error(typeof detail === "string" ? detail || fallbackMsg : fallbackMsg);
+    const apiError = errorFromResponsePayload(error, response.status);
+    throw new ApiError(apiError.message || fallbackMsg, apiError.code, apiError.status);
   }
 }
 
@@ -1772,11 +1804,14 @@ class API {
   /** 更新指定 provider 的配置字段。 */
   static async patchProviderConfig(
     id: string,
-    patch: Record<string, string | null>
+    patch: ProviderConfigPatch
   ): Promise<void> {
+    const normalized = Object.fromEntries(
+      Object.entries(patch).map(([key, value]) => [key, typeof value === "boolean" ? String(value) : value]),
+    );
     return this.request(`/providers/${encodeURIComponent(id)}/config`, {
       method: "PATCH",
-      body: JSON.stringify(patch),
+      body: JSON.stringify(normalized),
     });
   }
 
@@ -1796,7 +1831,14 @@ class API {
 
   static async createCredential(
     providerId: string,
-    data: { name: string; api_key?: string; base_url?: string; access_key?: string; secret_key?: string },
+    data: {
+      name: string;
+      api_key?: string;
+      base_url?: string;
+      access_key?: string;
+      secret_key?: string;
+      is_enabled?: boolean;
+    },
   ): Promise<ProviderCredential> {
     return this.request(`/providers/${encodeURIComponent(providerId)}/credentials`, {
       method: "POST",
@@ -1807,7 +1849,14 @@ class API {
   static async updateCredential(
     providerId: string,
     credId: number,
-    data: { name?: string; api_key?: string; base_url?: string; access_key?: string; secret_key?: string },
+    data: {
+      name?: string;
+      api_key?: string;
+      base_url?: string;
+      access_key?: string;
+      secret_key?: string;
+      is_enabled?: boolean;
+    },
   ): Promise<void> {
     return this.request(
       `/providers/${encodeURIComponent(providerId)}/credentials/${credId}`,
@@ -1816,10 +1865,11 @@ class API {
   }
 
   static async deleteCredential(providerId: string, credId: number): Promise<void> {
-    return this.request(
-      `/providers/${encodeURIComponent(providerId)}/credentials/${credId}`,
-      { method: "DELETE" },
+    const response = await fetch(
+      `${API_BASE}/providers/${encodeURIComponent(providerId)}/credentials/${credId}`,
+      withAuth({ method: "DELETE" }),
     );
+    await throwIfNotOk(response, "删除凭证失败");
   }
 
   static async activateCredential(providerId: string, credId: number): Promise<void> {
@@ -1830,10 +1880,20 @@ class API {
   }
 
   static async uploadVertexCredential(name: string, file: File): Promise<ProviderCredential> {
+    return this.uploadVertexCredentialWithOptions(name, file);
+  }
+
+  static async uploadVertexCredentialWithOptions(
+    name: string,
+    file: File,
+    options: { isEnabled?: boolean } = {},
+  ): Promise<ProviderCredential> {
     const formData = new FormData();
     formData.append("file", file);
+    const params = new URLSearchParams({ name });
+    if (options.isEnabled !== undefined) params.set("is_enabled", String(options.isEnabled));
     const response = await fetch(
-      `${API_BASE}/providers/gemini-vertex/credentials/upload?name=${encodeURIComponent(name)}`,
+      `${API_BASE}/providers/gemini-vertex/credentials/upload?${params.toString()}`,
       withAuth({ method: "POST", body: formData }),
     );
     await throwIfNotOk(response, "上传凭证失败");

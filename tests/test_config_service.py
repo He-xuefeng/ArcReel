@@ -125,3 +125,42 @@ async def test_set_other_number_keys_not_restricted_to_integers(config_service: 
     await config_service.set_provider_config("gemini-aistudio", "request_gap", "0.5")
     config = await config_service.get_provider_config("gemini-aistudio")
     assert config["request_gap"] == "0.5"
+
+
+@pytest.mark.parametrize(
+    ("raw", "canonical"),
+    [("true", "true"), ("false", "false"), ("  TRUE ", "true"), ("0", "false"), ("yes", "true")],
+)
+async def test_set_credential_pool_enabled_canonicalizes_bool(config_service: ConfigService, raw: str, canonical: str):
+    await config_service.set_provider_config("ark", "credential_pool_enabled", raw)
+    config = await config_service.get_provider_config("ark")
+    assert config["credential_pool_enabled"] == canonical
+
+
+@pytest.mark.parametrize("value", ["", "maybe", "2", "truthy"])
+async def test_set_credential_pool_enabled_rejects_invalid_bool(config_service: ConfigService, value: str):
+    from lib.config.service import ProviderConfigValueError
+
+    with pytest.raises(ProviderConfigValueError) as exc_info:
+        await config_service.set_provider_config("ark", "credential_pool_enabled", value)
+    assert exc_info.value.code == "credential_pool_enabled_must_be_boolean"
+    assert exc_info.value.key == "credential_pool_enabled"
+
+
+@pytest.mark.parametrize(("raw", "canonical"), [("shared", "shared"), ("separate", "separate"), (" SHARED ", "shared")])
+async def test_set_credential_pool_concurrency_mode_accepts_allowed_values(
+    config_service: ConfigService, raw: str, canonical: str
+):
+    await config_service.set_provider_config("ark", "credential_pool_concurrency_mode", raw)
+    config = await config_service.get_provider_config("ark")
+    assert config["credential_pool_concurrency_mode"] == canonical
+
+
+@pytest.mark.parametrize("value", ["", "combined", "shared,separate", "1"])
+async def test_set_credential_pool_concurrency_mode_rejects_unknown_values(config_service: ConfigService, value: str):
+    from lib.config.service import ProviderConfigValueError
+
+    with pytest.raises(ProviderConfigValueError) as exc_info:
+        await config_service.set_provider_config("ark", "credential_pool_concurrency_mode", value)
+    assert exc_info.value.code == "credential_pool_concurrency_mode_invalid"
+    assert exc_info.value.key == "credential_pool_concurrency_mode"

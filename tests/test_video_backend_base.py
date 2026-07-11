@@ -566,6 +566,42 @@ class TestPersistJobIdRetry:
 
         assert attempts == 1, "expects no string-fallback retry for ValueError"
 
+    async def test_persists_provider_job_binding_when_credential_id_is_present(self):
+        class _BindingQueue:
+            def __init__(self):
+                self.job_ids = []
+                self.bindings = []
+
+            async def persist_provider_job_id(self, *args, **kwargs):
+                self.job_ids.append((args, kwargs))
+
+            async def persist_provider_job_binding(self, **kwargs):
+                self.bindings.append(kwargs)
+
+        fake_queue = _BindingQueue()
+
+        with patch("lib.generation_queue.get_generation_queue", return_value=fake_queue):
+            await persist_provider_job_id(
+                "task-B",
+                "job-B",
+                provider="ark",
+                credential_id=77,
+                media_type="video",
+                model_id="seedance",
+            )
+
+        assert fake_queue.job_ids == []
+        assert fake_queue.bindings == [
+            {
+                "task_id": "task-B",
+                "provider": "ark",
+                "provider_job_id": "job-B",
+                "credential_id": 77,
+                "media_type": "video",
+                "model_id": "seedance",
+            }
+        ]
+
 
 class TestProviderJobIdPersistenceMixin:
     """提交-轮询型 video backend 的持久化收口点：单一统一调用点承接 None 判断 + 写回 + fail-fast。"""
@@ -583,13 +619,40 @@ class TestProviderJobIdPersistenceMixin:
             await self._backend()._persist_provider_job_id(
                 self._request(task_id="local-task-1"), "job-1", provider="ark"
             )
-        persist.assert_awaited_once_with("local-task-1", "job-1", provider="ark")
+        persist.assert_awaited_once_with(
+            "local-task-1",
+            "job-1",
+            provider="ark",
+            credential_id=None,
+            media_type="video",
+            model_id=None,
+        )
 
     async def test_non_worker_path_skips_persist(self):
         """非 worker 路径（grid / 直生 / 测试，task_id=None）跳过持久化，不触碰 DB。"""
         with patch("lib.video_backends.base.persist_provider_job_id", new=AsyncMock()) as persist:
             await self._backend()._persist_provider_job_id(self._request(task_id=None), "job-1", provider="ark")
         persist.assert_not_awaited()
+
+    async def test_worker_path_persists_binding_when_credential_is_present(self):
+        request = VideoGenerationRequest(
+            prompt="p",
+            output_path=Path("/tmp/out.mp4"),
+            task_id="local-task-2",
+            credential_id=123,
+            model_id="video-model",
+        )
+        with patch("lib.video_backends.base.persist_provider_job_id", new=AsyncMock()) as persist:
+            await self._backend()._persist_provider_job_id(request, "job-2", provider="ark")
+
+        persist.assert_awaited_once_with(
+            "local-task-2",
+            "job-2",
+            provider="ark",
+            credential_id=123,
+            media_type="video",
+            model_id="video-model",
+        )
 
     async def test_persist_failure_propagates_fail_fast(self):
         """持久化失败抛出原异常，由 worker finally 兜底 mark_failed（fail-fast，不吞）。"""

@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback, useRef, memo } from "react";
-import { useAutoFocus } from "@/hooks/useAutoFocus";
-import { errMsg, voidPromise } from "@/utils/async";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
 import {
   Check,
   Edit2,
@@ -11,9 +11,10 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { useTranslation } from "react-i18next";
-import type { TFunction } from "i18next";
-import { API } from "@/api";
+
+import { API, apiErrorCode } from "@/api";
+import { useAutoFocus } from "@/hooks/useAutoFocus";
+import { errMsg, voidPromise } from "@/utils/async";
 import {
   ACCENT_BTN_SM_CLS,
   ACCENT_BUTTON_STYLE,
@@ -23,25 +24,26 @@ import {
   INPUT_CLS,
 } from "@/components/ui/darkroom-tokens";
 import { FieldLabel } from "@/components/ui/FieldLabel";
-import type { CredentialSecretField, ProviderCredential, ProviderTestResult } from "@/types";
+import type {
+  CredentialPoolConcurrencyMode,
+  CredentialSecretField,
+  ProviderCredential,
+  ProviderTestResult,
+} from "@/types";
 
-// 单 secret provider 的默认凭证字段，供未显式传 secretFields 的调用方兜底（行为同旧版 api_key 表单）。
 const DEFAULT_SECRET_FIELDS: CredentialSecretField[] = [{ key: "api_key", label: "API Key" }];
 
-// 已知 secret 凭证字段 → 前端 i18n label key；未知 key 回退后端提供的 label。
 const SECRET_FIELD_LABEL_KEY: Record<string, string> = {
   api_key: "api_key_label",
   access_key: "access_key_label",
   secret_key: "secret_key_label",
 };
 
-// 解析 secret 字段标签：已知 key 走前端 i18n，未知 key 回退后端提供的 label。
 function secretFieldLabel(t: TFunction, field: CredentialSecretField): string {
-  const lk = SECRET_FIELD_LABEL_KEY[field.key];
-  return lk ? t(lk) : field.label;
+  const labelKey = SECRET_FIELD_LABEL_KEY[field.key];
+  return labelKey ? t(labelKey) : field.label;
 }
 
-// 逐字段读取脱敏值（与后端 *_masked 列一一对应）。
 function maskedForKey(cred: ProviderCredential, key: string): string | null | undefined {
   if (key === "api_key") return cred.api_key_masked;
   if (key === "access_key") return cred.access_key_masked;
@@ -52,6 +54,7 @@ function maskedForKey(cred: ProviderCredential, key: string): string | null | un
 interface RowProps {
   cred: ProviderCredential;
   providerId: string;
+  poolEnabled: boolean;
   isVertex: boolean;
   supportsBaseUrl: boolean;
   secretFields: CredentialSecretField[];
@@ -61,6 +64,7 @@ interface RowProps {
 const CredentialRow = memo(function CredentialRow({
   cred,
   providerId,
+  poolEnabled,
   isVertex,
   supportsBaseUrl,
   secretFields,
@@ -73,10 +77,17 @@ const CredentialRow = memo(function CredentialRow({
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [saving, setSaving] = useState(false);
-  // secrets 留空表示保留现有值；逐字段独立编辑。
-  const [draft, setDraft] = useState<{ name: string; base_url: string; secrets: Record<string, string> }>({
+  const [poolSaving, setPoolSaving] = useState(false);
+  const [rowError, setRowError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<{
+    name: string;
+    base_url: string;
+    is_enabled: boolean;
+    secrets: Record<string, string>;
+  }>({
     name: cred.name,
     base_url: cred.base_url ?? "",
+    is_enabled: cred.is_enabled,
     secrets: {},
   });
 
@@ -84,27 +95,31 @@ const CredentialRow = memo(function CredentialRow({
 
   const handleActivate = useCallback(async () => {
     try {
+      setRowError(null);
       await API.activateCredential(providerId, cred.id);
       onChanged();
-    } catch {
-      // 网络错误静默处理
+    } catch (e) {
+      setRowError(errMsg(e));
     }
   }, [providerId, cred.id, onChanged]);
 
   const handleTest = useCallback(async () => {
     setTesting(true);
     setTestResult(null);
+    setRowError(null);
     try {
       const result = await API.testProviderConnection(providerId, cred.id);
       setTestResult(result);
     } catch (e) {
       setTestResult({ success: false, available_models: [], message: errMsg(e) });
+    } finally {
+      setTesting(false);
     }
-    setTesting(false);
   }, [providerId, cred.id]);
 
   const handleDelete = useCallback(async () => {
     if (!confirmDelete) {
+      setRowError(null);
       setConfirmDelete(true);
       return;
     }
@@ -112,35 +127,59 @@ const CredentialRow = memo(function CredentialRow({
     try {
       await API.deleteCredential(providerId, cred.id);
       onChanged();
+    } catch (e) {
+      setRowError(apiErrorCode(e) === "credential_in_use" ? t("credential_in_use") : errMsg(e));
     } finally {
       setDeleting(false);
       setConfirmDelete(false);
     }
-  }, [providerId, cred.id, confirmDelete, onChanged]);
+  }, [providerId, cred.id, confirmDelete, onChanged, t]);
+
+  const handlePoolParticipationChange = useCallback(async (next: boolean) => {
+    setPoolSaving(true);
+    setRowError(null);
+    try {
+      await API.updateCredential(providerId, cred.id, { is_enabled: next });
+      onChanged();
+    } catch (e) {
+      setRowError(errMsg(e));
+      onChanged();
+    } finally {
+      setPoolSaving(false);
+    }
+  }, [providerId, cred.id, onChanged]);
 
   const handleSaveEdit = useCallback(async () => {
-    const data: Record<string, string> = {};
+    type UpdateCredentialPayload = Parameters<typeof API.updateCredential>[2];
+    const data: UpdateCredentialPayload = {};
+    const dynamicData = data as Record<string, string | boolean | undefined>;
+
     if (draft.name && draft.name !== cred.name) data.name = draft.name;
     for (const field of secretFields) {
       const val = draft.secrets[field.key]?.trim();
-      if (val) data[field.key] = val;
+      if (val) dynamicData[field.key] = val;
     }
     if (draft.base_url !== (cred.base_url ?? "")) data.base_url = draft.base_url;
+    if (poolEnabled && draft.is_enabled !== cred.is_enabled) data.is_enabled = draft.is_enabled;
     if (Object.keys(data).length === 0) {
       setEditing(false);
       return;
     }
     setSaving(true);
+    setRowError(null);
     try {
       await API.updateCredential(providerId, cred.id, data);
       setEditing(false);
       onChanged();
+    } catch (e) {
+      setRowError(errMsg(e));
     } finally {
       setSaving(false);
     }
-  }, [draft, cred, providerId, secretFields, onChanged]);
+  }, [draft, cred, poolEnabled, providerId, secretFields, onChanged]);
 
   const editPrefix = `cred-edit-${cred.id}`;
+  const showLeaseCount = poolEnabled || cred.active_lease_count > 0;
 
   return (
     <div
@@ -156,28 +195,43 @@ const CredentialRow = memo(function CredentialRow({
       }
     >
       <div className="flex items-center gap-3">
-        <button
-          type="button"
-          onClick={cred.is_active ? undefined : voidPromise(handleActivate)}
-          disabled={cred.is_active}
-          aria-label={cred.is_active ? t("currently_active") : t("activate_credential", { name: cred.name })}
-          className={`h-2.5 w-2.5 flex-shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
-            cred.is_active
-              ? ""
-              : "border border-hairline-strong hover:border-accent-2 cursor-pointer"
-          }`}
-          style={
-            cred.is_active
-              ? {
-                  background: "var(--color-accent)",
-                  boxShadow: "0 0 8px var(--color-accent-glow)",
-                }
-              : undefined
-          }
-        />
+        {poolEnabled ? (
+          <label className="flex flex-shrink-0 items-center gap-2 rounded-[7px] border border-hairline-soft bg-bg-grad-a/45 px-2 py-1 text-[11px] text-text-2">
+            <input
+              type="checkbox"
+              checked={cred.is_enabled}
+              disabled={poolSaving}
+              onChange={(e) => void handlePoolParticipationChange(e.currentTarget.checked)}
+              aria-label={t("credential_pool_participation_for", { name: cred.name })}
+              className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+            />
+            {poolSaving ? <Loader2 className="h-3 w-3 motion-safe:animate-spin" aria-hidden /> : null}
+            <span>{t("credential_pool_participation")}</span>
+          </label>
+        ) : (
+          <button
+            type="button"
+            onClick={cred.is_active ? undefined : voidPromise(handleActivate)}
+            disabled={cred.is_active}
+            aria-label={cred.is_active ? t("currently_active") : t("activate_credential", { name: cred.name })}
+            className={`h-2.5 w-2.5 flex-shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+              cred.is_active
+                ? ""
+                : "cursor-pointer border border-hairline-strong hover:border-accent-2"
+            }`}
+            style={
+              cred.is_active
+                ? {
+                    background: "var(--color-accent)",
+                    boxShadow: "0 0 8px var(--color-accent-glow)",
+                  }
+                : undefined
+            }
+          />
+        )}
 
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className="text-[13px] font-medium text-text">{cred.name}</span>
             {cred.is_active && (
               <span
@@ -188,7 +242,12 @@ const CredentialRow = memo(function CredentialRow({
                   border: "1px solid var(--color-accent-soft)",
                 }}
               >
-                {t("active_label")}
+                {poolEnabled ? t("default_preferred_label") : t("active_label")}
+              </span>
+            )}
+            {showLeaseCount && (
+              <span className="rounded-full border border-hairline-soft bg-bg-grad-a/45 px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase tracking-[0.14em] text-text-4">
+                {t("active_pool_leases", { count: cred.active_lease_count })}
               </span>
             )}
           </div>
@@ -230,8 +289,9 @@ const CredentialRow = memo(function CredentialRow({
               type="button"
               onClick={() => {
                 setEditing(!editing);
-                setDraft({ name: cred.name, base_url: cred.base_url ?? "", secrets: {} });
+                setDraft({ name: cred.name, base_url: cred.base_url ?? "", is_enabled: cred.is_enabled, secrets: {} });
                 setTestResult(null);
+                setRowError(null);
               }}
               aria-label={t("edit_credential", { name: cred.name })}
               className={ICON_BTN_CLS}
@@ -280,7 +340,6 @@ const CredentialRow = memo(function CredentialRow({
         </div>
       </div>
 
-      {/* Test result */}
       {testResult && (
         <div
           aria-live="polite"
@@ -308,7 +367,20 @@ const CredentialRow = memo(function CredentialRow({
         </div>
       )}
 
-      {/* Inline edit */}
+      {rowError && (
+        <p
+          aria-live="polite"
+          className="mt-2 ml-5.5 rounded-[8px] px-3 py-2 text-[12px]"
+          style={{
+            background: "var(--color-warm-tint)",
+            color: "var(--color-warm-bright)",
+            border: "1px solid var(--color-warm-ring)",
+          }}
+        >
+          {rowError}
+        </p>
+      )}
+
       {editing && (
         <div
           className="mt-2.5 ml-5.5 space-y-2.5 rounded-[8px] border border-hairline p-3"
@@ -356,6 +428,17 @@ const CredentialRow = memo(function CredentialRow({
               />
             </div>
           )}
+          {poolEnabled && (
+            <label className="flex items-center gap-2 rounded-[7px] border border-hairline-soft bg-bg-grad-a/45 px-2.5 py-2 text-[12px] text-text-2">
+              <input
+                type="checkbox"
+                checked={draft.is_enabled}
+                onChange={(e) => setDraft((d) => ({ ...d, is_enabled: e.currentTarget.checked }))}
+                className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+              />
+              {t("credential_pool_participation")}
+            </label>
+          )}
           <div className="flex gap-2 pt-0.5">
             <button
               type="button"
@@ -389,9 +472,8 @@ interface AddFormProps {
   providerId: string;
   isVertex: boolean;
   supportsBaseUrl: boolean;
+  poolEnabled: boolean;
   secretFields: CredentialSecretField[];
-  // 凭证「二选一」分组：满足任一组即视为凭证完整。单组（绝大多数 provider）等价于旧版
-  // 「全部必填」；可灵等多组 provider 下没有单个字段是无条件必填的，故不渲染红色必填星标。
   secretFieldGroups: string[][];
   onCreated: () => void;
   onCancel: () => void;
@@ -401,6 +483,7 @@ function AddCredentialForm({
   providerId,
   isVertex,
   supportsBaseUrl,
+  poolEnabled,
   secretFields,
   secretFieldGroups,
   onCreated,
@@ -410,6 +493,7 @@ function AddCredentialForm({
   const [name, setName] = useState("");
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [baseUrl, setBaseUrl] = useState("");
+  const [isEnabled, setIsEnabled] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -417,14 +501,11 @@ function AddCredentialForm({
   const nameRef = useAutoFocus<HTMLInputElement>();
 
   const labelFor = (field: CredentialSecretField): string => secretFieldLabel(t, field);
-  const fieldByKey = new Map(secretFields.map((f) => [f.key, f]));
+  const fieldByKey = new Map(secretFields.map((field) => [field.key, field]));
   const labelForKey = (key: string): string => labelFor(fieldByKey.get(key) ?? { key, label: key });
-  // 兜底：调用方未传分组时退化为单一必填组（= 全部 secret_fields），与旧版语义一致。
-  const groups = secretFieldGroups.length > 0 ? secretFieldGroups : [secretFields.map((f) => f.key)];
-  // 仅单一必填组时，组内每个字段才是无条件必填（旧版行为）；多组二选一时不标红星，
-  // 靠下方 orHint 提示组合关系，避免误导用户以为要填满所有字段。
+  const groups = secretFieldGroups.length > 0 ? secretFieldGroups : [secretFields.map((field) => field.key)];
   const fieldsUnconditionallyRequired = groups.length <= 1;
-  const orHint = groups.length > 1 ? groups.map((g) => g.map(labelForKey).join(" + ")).join(` ${t("or_label")} `) : null;
+  const orHint = groups.length > 1 ? groups.map((group) => group.map(labelForKey).join(" + ")).join(` ${t("or_label")} `) : null;
 
   const handleSubmit = async () => {
     if (!name.trim()) return;
@@ -438,20 +519,22 @@ function AddCredentialForm({
           setSaving(false);
           return;
         }
-        await API.uploadVertexCredential(name, file);
+        await API.uploadVertexCredentialWithOptions(name.trim(), file, { isEnabled: poolEnabled ? isEnabled : undefined });
       } else {
-        // 至少一组（组内字段全填）即视为凭证完整；单组场景等价于旧版「全部必填」。
-        const groupSatisfied = (group: string[]) => group.every((k) => (secrets[k] ?? "").trim());
+        const groupSatisfied = (group: string[]) => group.every((key) => (secrets[key] ?? "").trim());
         if (!groups.some(groupSatisfied)) {
           setError(groups.length > 1 ? t("enter_credentials_required_any_group") : t("enter_credentials_required"));
           setSaving(false);
           return;
         }
-        const payload: { name: string; [key: string]: string | undefined } = {
+        type CreateCredentialPayload = Parameters<typeof API.createCredential>[1];
+        const payload: CreateCredentialPayload = {
           name: name.trim(),
           base_url: baseUrl || undefined,
+          is_enabled: poolEnabled ? isEnabled : undefined,
         };
-        for (const field of secretFields) payload[field.key] = secrets[field.key]?.trim();
+        const dynamicPayload = payload as Record<string, string | boolean | undefined>;
+        for (const field of secretFields) dynamicPayload[field.key] = secrets[field.key]?.trim();
         await API.createCredential(providerId, payload);
       }
       onCreated();
@@ -522,7 +605,7 @@ function AddCredentialForm({
                 type="password"
                 autoComplete="off"
                 value={secrets[field.key] ?? ""}
-                onChange={(e) => setSecrets((s) => ({ ...s, [field.key]: e.target.value }))}
+                onChange={(e) => setSecrets((current) => ({ ...current, [field.key]: e.target.value }))}
                 className={INPUT_CLS}
               />
             </div>
@@ -542,6 +625,17 @@ function AddCredentialForm({
             </div>
           )}
         </>
+      )}
+      {poolEnabled && (
+        <label className="flex items-center gap-2 rounded-[7px] border border-hairline-soft bg-bg-grad-a/45 px-2.5 py-2 text-[12px] text-text-2">
+          <input
+            type="checkbox"
+            checked={isEnabled}
+            onChange={(e) => setIsEnabled(e.currentTarget.checked)}
+            className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+          />
+          {t("credential_pool_participation")}
+        </label>
       )}
       {error && (
         <p
@@ -586,48 +680,69 @@ function AddCredentialForm({
 interface Props {
   providerId: string;
   supportsBaseUrl: boolean;
+  poolEnabled?: boolean;
+  poolConcurrencyMode?: CredentialPoolConcurrencyMode;
+  refreshKey?: number;
   secretFields?: CredentialSecretField[];
-  // 凭证「二选一」分组，见 AddFormProps 注释；未传时按单组全字段回退（旧版行为）。
   secretFieldGroups?: string[][];
   onChanged?: () => void;
 }
 
-export function CredentialList({ providerId, supportsBaseUrl, secretFields, secretFieldGroups, onChanged }: Props) {
+export function CredentialList({
+  providerId,
+  supportsBaseUrl,
+  poolEnabled = false,
+  poolConcurrencyMode = "shared",
+  refreshKey = 0,
+  secretFields,
+  secretFieldGroups,
+  onChanged,
+}: Props) {
   const fields = secretFields ?? DEFAULT_SECRET_FIELDS;
-  const fieldGroups = secretFieldGroups ?? [fields.map((f) => f.key)];
+  const fieldGroups = secretFieldGroups ?? [fields.map((field) => field.key)];
   const { t } = useTranslation("dashboard");
-  const [credentials, setCredentials] = useState<ProviderCredential[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [showAdd, setShowAdd] = useState(false);
+  const requestKey = `${providerId}:${refreshKey}`;
+  const [credentialState, setCredentialState] = useState<{
+    requestKey: string | null;
+    credentials: ProviderCredential[];
+  }>({ requestKey: null, credentials: [] });
+  const [showAddState, setShowAddState] = useState({ requestKey, visible: false });
+  const loading = credentialState.requestKey !== requestKey;
+  const credentials = loading ? [] : credentialState.credentials;
+  const showAdd = showAddState.requestKey === requestKey && showAddState.visible;
   const isVertex = providerId === "gemini-vertex";
+  const poolHasNoEnabledCredentials = poolEnabled && credentials.length > 0 && !credentials.some((cred) => cred.is_enabled);
 
-  const onChangedRef = useRef(onChanged);
-  // 同步最新 onChanged 回调到 ref，供异步刷新后调用
-  useEffect(() => {
-    onChangedRef.current = onChanged;
-  }, [onChanged]);
+  const setShowAddForCurrent = useCallback(
+    (visible: boolean) => setShowAddState({ requestKey, visible }),
+    [requestKey],
+  );
 
   const refresh = useCallback(async () => {
-    try {
-      const { credentials: creds } = await API.listCredentials(providerId);
-      setCredentials(creds);
-    } finally {
-      setLoading(false);
-    }
-  }, [providerId]);
+    const { credentials: creds } = await API.listCredentials(providerId);
+    setCredentialState({ requestKey, credentials: creds });
+  }, [providerId, requestKey]);
 
   const handleChanged = useCallback(async () => {
     await refresh();
-    onChangedRef.current?.();
-  }, [refresh]);
+    onChanged?.();
+  }, [refresh, onChanged]);
+
+  const handleChangedVoid = useCallback(() => {
+    void handleChanged();
+  }, [handleChanged]);
 
   useEffect(() => {
-    // providerId 变化时重置加载态并重新拉取，属于动作驱动的状态重置
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setLoading(true);
-    setShowAdd(false);
-    void refresh();
-  }, [refresh]);
+    let disposed = false;
+    API.listCredentials(providerId)
+      .then(({ credentials: creds }) => {
+        if (!disposed) setCredentialState({ requestKey, credentials: creds });
+      })
+      .catch(console.error);
+    return () => {
+      disposed = true;
+    };
+  }, [providerId, requestKey]);
 
   if (loading) {
     return (
@@ -642,14 +757,21 @@ export function CredentialList({ providerId, supportsBaseUrl, secretFields, secr
 
   return (
     <div>
-      <div className="mb-2.5 flex items-center justify-between">
-        <div className="font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-accent-2">
-          {t("credential_mgmt")}
+      <div className="mb-2.5 flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-accent-2">
+            {t("credential_mgmt")}
+          </div>
+          {poolEnabled && (
+            <span className="rounded-full border border-hairline-soft bg-bg-grad-a/45 px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-[0.14em] text-text-4">
+              {poolConcurrencyMode === "shared" ? t("credential_pool_shared") : t("credential_pool_separate")}
+            </span>
+          )}
         </div>
         {!showAdd && (
           <button
             type="button"
-            onClick={() => setShowAdd(true)}
+            onClick={() => setShowAddForCurrent(true)}
             className="inline-flex items-center gap-1 rounded-[6px] px-2 py-1 font-mono text-[10.5px] font-bold uppercase tracking-[0.14em] text-accent-2 transition-colors hover:bg-accent-dim hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           >
             <Plus className="h-3 w-3" /> {t("add_credential")}
@@ -657,12 +779,25 @@ export function CredentialList({ providerId, supportsBaseUrl, secretFields, secr
         )}
       </div>
 
+      {poolHasNoEnabledCredentials && (
+        <p
+          className="mb-2 rounded-[8px] px-3 py-2 text-[12px]"
+          style={{
+            background: "var(--color-warm-tint)",
+            color: "var(--color-warm-bright)",
+            border: "1px solid var(--color-warm-ring)",
+          }}
+        >
+          {t("no_enabled_pool_credentials")}
+        </p>
+      )}
+
       {credentials.length === 0 && !showAdd && (
         <div className="rounded-[10px] border border-dashed border-hairline-strong bg-bg-grad-a/45 px-4 py-7 text-center">
           <p className="text-[12.5px] text-text-3">{t("no_credentials")}</p>
           <button
             type="button"
-            onClick={() => setShowAdd(true)}
+            onClick={() => setShowAddForCurrent(true)}
             className="mt-2 inline-flex items-center gap-1 font-mono text-[10.5px] font-bold uppercase tracking-[0.14em] text-accent-2 transition-colors hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           >
             <Plus className="h-3 w-3" /> {t("add_first_credential")}
@@ -671,17 +806,16 @@ export function CredentialList({ providerId, supportsBaseUrl, secretFields, secr
       )}
 
       <div className="space-y-1.5">
-        {/* 子组件 onChanged 通过 voidPromise 包装 ref 持有的最新回调 */}
-        {/* eslint-disable-next-line react-hooks/refs */}
-        {credentials.map((c) => (
+        {credentials.map((credential) => (
           <CredentialRow
-            key={c.id}
-            cred={c}
+            key={credential.id}
+            cred={credential}
             providerId={providerId}
+            poolEnabled={poolEnabled}
             isVertex={isVertex}
             supportsBaseUrl={supportsBaseUrl}
             secretFields={fields}
-            onChanged={voidPromise(handleChanged)}
+            onChanged={handleChangedVoid}
           />
         ))}
       </div>
@@ -692,13 +826,14 @@ export function CredentialList({ providerId, supportsBaseUrl, secretFields, secr
             providerId={providerId}
             isVertex={isVertex}
             supportsBaseUrl={supportsBaseUrl}
+            poolEnabled={poolEnabled}
             secretFields={fields}
             secretFieldGroups={fieldGroups}
             onCreated={() => {
-              setShowAdd(false);
+              setShowAddForCurrent(false);
               void handleChanged();
             }}
-            onCancel={() => setShowAdd(false)}
+            onCancel={() => setShowAddForCurrent(false)}
           />
         </div>
       )}

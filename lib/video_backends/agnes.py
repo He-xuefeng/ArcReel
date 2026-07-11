@@ -1,8 +1,9 @@
 """AgnesVideoBackend — Agnes 视频生成后端（裸 base64 + 异步轮询 + resume）。
 
-走 apihub 网关上的 OpenAI 风格异步端点：submit ``POST /v1/videos``（JSON）取 task_id →
-轮询 ``GET /v1/videos/{task_id}`` 至 ``status=completed`` → 从响应 ``url`` 字段（优先）或
-``remixed_from_video_id`` 字段（回退）取成片 mp4 URL → 下载本地。状态机 ``queued → in_progress → completed / failed``。
+走 apihub 网关上的 OpenAI 风格异步端点：submit ``POST /v1/videos``（JSON）取 provider job id →
+优先轮询官方推荐的 ``GET /agnesapi?video_id=...``，必要时回退 ``GET /v1/videos/{id}``，至
+``status=completed`` → 从响应 ``url`` / ``remixed_from_video_id`` / ``metadata.url`` 字段取成片 mp4 URL →
+下载本地。状态机 ``queued → in_progress → completed / failed``。
 
 能力约束：fps 固定 24；时长 1–18s（内部 ``num_frames = 最近的 8n+1``，由秒 × fps 取整对齐，
 上限 441 帧）；分辨率经 aspect_size 精确算出并显式下发 ``height`` × ``width``（不显式下发时
@@ -20,6 +21,7 @@ import base64
 import logging
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -136,14 +138,36 @@ def _safe_body_for_log(body: dict) -> dict:
     return view
 
 
-def _extract_task_id(body: dict) -> str:
-    """从提交响应取轮询用 task_id（``task_id`` 优先，回落 ``id``）。"""
-    for key in ("task_id", "id"):
+def _extract_provider_job_id(body: dict) -> str:
+    """从提交响应取轮询用 provider job id（``video_id`` 优先，回落 ``task_id`` / ``id``）。"""
+    for key in ("video_id", "task_id", "id"):
         value = body.get(key)
         if isinstance(value, str) and value:
             return value
     # 仅暴露字段名，不回显整串响应（可能含 prompt / 签名 URL 等敏感字段，与 _safe_body_for_log 同口径）。
-    raise RuntimeError(f"Agnes 视频提交返回体缺少 task_id（字段: {sorted(body)}）")
+    raise RuntimeError(f"Agnes 视频提交返回体缺少 video_id/task_id/id（字段: {sorted(body)}）")
+
+
+def _agnes_query_url(base_url: str) -> str:
+    """从 OpenAI 风格 base URL 派生官方推荐查询端点：``{origin}/agnesapi``。"""
+    parts = urlsplit(base_url)
+    return urlunsplit((parts.scheme, parts.netloc, "/agnesapi", "", ""))
+
+
+def _extract_video_url(final: dict) -> str | None:
+    """从 Agnes completed 响应提取真正的 mp4 URL。
+
+    ``video_id`` 在部分响应中只是 task id，不是下载地址；只有明确的 URL 字段才可下载。
+    """
+    for value in (final.get("url"), final.get("remixed_from_video_id")):
+        if isinstance(value, str) and value:
+            return value
+    metadata = final.get("metadata")
+    if isinstance(metadata, dict):
+        value = metadata.get("url")
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _extract_duration_seconds(final: dict, fallback: int) -> int:
@@ -244,10 +268,10 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
             format_kwargs_for_log(_safe_body_for_log(payload)),
         )
         async with httpx.AsyncClient(timeout=self._http_timeout) as client:
-            task_id = await self._create_task(client, payload)
-            logger.info("Agnes 视频任务已创建: task_id=%s model=%s", task_id, self._model)
-            await self._persist_provider_job_id(request, task_id, provider=PROVIDER_AGNES)
-            return await self._poll_and_build(client, task_id, request, is_resume=False)
+            provider_job_id = await self._create_task(client, payload)
+            logger.info("Agnes 视频任务已创建: provider_job_id=%s model=%s", provider_job_id, self._model)
+            await self._persist_provider_job_id(request, provider_job_id, provider=PROVIDER_AGNES)
+            return await self._poll_and_build(client, provider_job_id, request, is_resume=False)
 
     async def resume_video(self, job_id: str, request: VideoGenerationRequest) -> VideoGenerationResult:
         """接续已 submit 的 Agnes task：仅轮询 + 下载，不重新提交（ADR 0007）。"""
@@ -374,20 +398,26 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
             ),
             provider=PROVIDER_AGNES,
         )
-        return _extract_task_id(resp.json())
+        return _extract_provider_job_id(resp.json())
 
-    async def _poll_once(self, client: httpx.AsyncClient, task_id: str) -> dict:
+    async def _poll_once(self, client: httpx.AsyncClient, provider_job_id: str) -> dict:
         resp = await client.get(
-            f"{self._base_url}{_VIDEOS_ENDPOINT}/{task_id}",
+            _agnes_query_url(self._base_url),
+            params={"video_id": provider_job_id},
             headers=agnes_headers(self._api_key),
         )
+        if resp.status_code in (404, 405):
+            resp = await client.get(
+                f"{self._base_url}{_VIDEOS_ENDPOINT}/{provider_job_id}",
+                headers=agnes_headers(self._api_key),
+            )
         resp.raise_for_status()
         return resp.json()
 
     async def _poll_and_build(
         self,
         client: httpx.AsyncClient,
-        task_id: str,
+        provider_job_id: str,
         request: VideoGenerationRequest,
         *,
         is_resume: bool,
@@ -397,10 +427,10 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
         # 4xx 原样抛出，交 should_retry_poll 按 status_code 分流。
         async def _gated_poll() -> dict:
             try:
-                return await self._poll_once(client, task_id)
+                return await self._poll_once(client, provider_job_id)
             except httpx.HTTPStatusError as exc:
                 if is_resume and exc.response.status_code == 404:
-                    raise ResumeExpiredError(job_id=task_id, provider=PROVIDER_AGNES) from exc
+                    raise ResumeExpiredError(job_id=provider_job_id, provider=PROVIDER_AGNES) from exc
                 raise
 
         final = await poll_with_retry(
@@ -419,8 +449,7 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
             ),
         )
 
-        # 优先使用 url 字段，回退到 remixed_from_video_id（兼容旧版响应格式）
-        video_url = final.get("url") or final.get("remixed_from_video_id")
+        video_url = _extract_video_url(final)
         if not isinstance(video_url, str) or not video_url:
             # 仅暴露字段名，不回显整串响应（可能含签名 URL 等敏感字段，与 _safe_body_for_log 同口径）。
             raise RuntimeError(f"Agnes 任务完成但缺少成片 URL（字段: {sorted(final)}）")
@@ -434,7 +463,7 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
             model=self._model,
             duration_seconds=_extract_duration_seconds(final, request.duration_seconds),
             video_uri=video_url,
-            task_id=task_id,
+            task_id=provider_job_id,
             seed=request.seed,
             # Agnes 视频无音频能力（未声明 GENERATE_AUDIO、提交体不带音频字段），成片恒无声；
             # 固定 False 与 kling/vidu 无声模型一致，避免下游（计费/版本元数据/剪映导出）误判有声。

@@ -263,6 +263,14 @@ class TestGenerationTasks:
             ),
         )
 
+        media_generator_kwargs: list[dict] = []
+
+        async def _capturing_get_media_generator(*_args, **kwargs):
+            media_generator_kwargs.append(kwargs)
+            return fake_generator
+
+        monkeypatch.setattr(generation_tasks, "get_media_generator", _capturing_get_media_generator)
+
         storyboard_result = await generation_tasks.execute_storyboard_task(
             "demo",
             "E1S02",
@@ -271,8 +279,10 @@ class TestGenerationTasks:
                 "prompt": "direct prompt",
                 "extra_reference_images": ["characters/Alice.png"],
             },
+            credential_id=456,
         )
         assert storyboard_result["resource_type"] == "storyboards"
+        assert media_generator_kwargs[0]["credential_id"] == 456
         storyboard_refs = fake_generator.image_calls[0]["reference_images"]
         assert storyboard_refs == [
             project_path / "characters" / "Alice.png",
@@ -715,8 +725,9 @@ class TestGenerationTasks:
             async def default_image_backend(self):
                 raise AssertionError("video tasks should not resolve image backend")
 
-        async def _fake_resolve_video_backend(project_name, resolver, payload):
+        async def _fake_resolve_video_backend(project_name, resolver, payload, *, credential_id=None):
             assert project_name == "demo"
+            assert credential_id is None
             # 2 元组：(video_backend, provider_id)
             return fake_video_backend, "gemini-aistudio"
 

@@ -89,6 +89,26 @@ class TestExecuteTtsTask:
         # 无 script_file → 不写回 narration_audio
         assert pm.updated_assets == []
 
+    async def test_credential_id_passed_to_media_generator(self, monkeypatch, tmp_path):
+        pm = _FakePM(tmp_path / "projects" / "demo")
+        gen = _FakeAudioGenerator()
+        calls: list[dict] = []
+
+        async def _capturing_get_media_generator(*_args, **kwargs):
+            calls.append(kwargs)
+            return gen
+
+        monkeypatch.setattr(generation_tasks, "get_project_manager", lambda: pm)
+        monkeypatch.setattr(generation_tasks, "get_media_generator", _capturing_get_media_generator)
+        monkeypatch.setattr(ConfigResolver, "resolve_narration_voice", _async_return("Cherry"))
+        monkeypatch.setattr(ConfigResolver, "resolve_narration_speed", _async_return(None))
+
+        await generation_tasks.execute_tts_task("demo", "E1S01", {"text": "你好"}, credential_id=789)
+
+        assert calls[0]["credential_id"] == 789
+        assert calls[0]["needs_audio"] is True
+        assert calls[0]["require_image_backend"] is False
+
     async def test_text_from_script_segment_and_writeback(self, tts_env):
         pm, gen = tts_env
         await generation_tasks.execute_tts_task("demo", "E1S01", {"script_file": "episode_1.json"})
@@ -136,8 +156,8 @@ class TestGetOrCreateAudioBackend:
         sentinel = object()
         calls = []
 
-        async def _fake_assemble(*, provider_id, media_type, model_id, resolver, rate_limiter=None):
-            calls.append((provider_id, media_type, model_id))
+        async def _fake_assemble(*, provider_id, media_type, model_id, resolver, rate_limiter=None, credential_id=None):
+            calls.append((provider_id, media_type, model_id, credential_id))
             return sentinel
 
         monkeypatch.setattr(generation_tasks, "assemble_backend", _fake_assemble)
@@ -148,14 +168,14 @@ class TestGetOrCreateAudioBackend:
         b2 = await generation_tasks._get_or_create_audio_backend("custom-3", {"model": "tts-1"}, resolver)
 
         assert b1 is sentinel and b2 is sentinel
-        assert calls == [("custom-3", "audio", "tts-1")], "第二次调用须命中缓存，不再重建 backend"
+        assert calls == [("custom-3", "audio", "tts-1", None)], "第二次调用须命中缓存，不再重建 backend"
 
     async def test_builtin_created_and_cached(self, monkeypatch):
         created = []
         sentinel = object()
 
-        async def _fake_assemble(*, provider_id, media_type, model_id, resolver, rate_limiter=None):
-            created.append((provider_id, media_type, model_id))
+        async def _fake_assemble(*, provider_id, media_type, model_id, resolver, rate_limiter=None, credential_id=None):
+            created.append((provider_id, media_type, model_id, credential_id))
             return sentinel
 
         monkeypatch.setattr(generation_tasks, "assemble_backend", _fake_assemble)
@@ -169,12 +189,12 @@ class TestGetOrCreateAudioBackend:
             "dashscope", {}, resolver, default_audio_model="qwen3-tts-flash"
         )
         assert b1 is sentinel and b2 is sentinel
-        assert created == [("dashscope", "audio", "qwen3-tts-flash")], "第二次调用须命中缓存，不再重建 backend"
+        assert created == [("dashscope", "audio", "qwen3-tts-flash", None)], "第二次调用须命中缓存，不再重建 backend"
 
     async def test_payload_model_overrides_default(self, monkeypatch):
         calls = []
 
-        async def _fake_assemble(*, provider_id, media_type, model_id, resolver, rate_limiter=None):
+        async def _fake_assemble(*, provider_id, media_type, model_id, resolver, rate_limiter=None, credential_id=None):
             calls.append(model_id)
             return object()
 

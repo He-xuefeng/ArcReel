@@ -33,6 +33,7 @@ from lib.config.service import (
 )
 from lib.custom_provider import is_custom_provider, parse_provider_id
 from lib.custom_provider.endpoints import get_endpoint_spec
+from lib.db.repositories.credential_pool_repository import CredentialPoolRepository, CredentialPoolSettings
 from lib.db.repositories.credential_repository import CredentialRepository
 from lib.db.repositories.custom_provider_repo import CustomProviderRepository
 from lib.project_manager import ProjectManager
@@ -361,10 +362,18 @@ class ConfigResolver:
         """兼容 shim：旧调用方仍可调；返回 T2I 变体。"""
         return await self.default_image_backend_t2i()
 
-    async def provider_config(self, provider_id: str) -> dict[str, str]:
+    async def provider_config(self, provider_id: str, credential_id: int | None = None) -> dict[str, str]:
         """获取单个供应商配置。"""
         async with self._open_session() as (session, svc):
-            return await self._resolve_provider_config(svc, session, provider_id)
+            return await self._resolve_provider_config(svc, session, provider_id, credential_id=credential_id)
+
+    async def pool_settings(self, provider_id: str) -> CredentialPoolSettings:
+        """获取预置供应商凭证池化设置。"""
+        if is_custom_provider(provider_id):
+            raise ValueError("custom providers do not support credential pooling")
+        async with self._open_session() as (session, svc):
+            svc._validate_provider(provider_id)
+            return await CredentialPoolRepository(session).get_pool_settings(provider_id)
 
     async def all_provider_configs(self) -> dict[str, dict[str, str]]:
         """批量获取所有供应商配置。"""
@@ -673,12 +682,22 @@ class ConfigResolver:
         svc: ConfigService,
         session: AsyncSession,
         provider_id: str,
+        *,
+        credential_id: int | None = None,
     ) -> dict[str, str]:
+        if credential_id is not None and is_custom_provider(provider_id):
+            raise ValueError("custom providers do not support credential-specific config")
         config = await svc.get_provider_config(provider_id)
         cred_repo = CredentialRepository(session)
-        active = await cred_repo.get_active(provider_id)
-        if active:
-            active.overlay_config(config)
+        credential = (
+            await cred_repo.get_by_id_for_provider(provider_id, credential_id)
+            if credential_id is not None
+            else await cred_repo.get_active(provider_id)
+        )
+        if credential_id is not None and credential is None:
+            raise ValueError(f"credential {credential_id} does not belong to provider {provider_id}")
+        if credential:
+            credential.overlay_config(config)
         return config
 
     async def _resolve_reference_payload_limits(

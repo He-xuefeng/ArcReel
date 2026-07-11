@@ -30,6 +30,8 @@ class Task(UserOwnedMixin, Base):
     cancelled_by: Mapped[str | None] = mapped_column(String)
     provider_id: Mapped[str | None] = mapped_column(String)
     provider_job_id: Mapped[str | None] = mapped_column(String)
+    credential_id: Mapped[int | None] = mapped_column(Integer)
+    wait_reason: Mapped[str | None] = mapped_column(String(64))
     queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -40,6 +42,8 @@ class Task(UserOwnedMixin, Base):
         Index("idx_tasks_project_updated_at", "project_name", "updated_at"),
         Index("idx_tasks_dependency_task_id", "dependency_task_id"),
         Index("idx_tasks_status_provider_queued", "status", "provider_id", "queued_at"),
+        Index("idx_tasks_status_provider_wait", "status", "provider_id", "wait_reason", "queued_at"),
+        Index("idx_tasks_credential_status", "credential_id", "status"),
         Index(
             "idx_tasks_dedupe_active",
             "project_name",

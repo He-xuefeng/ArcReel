@@ -8,7 +8,7 @@ import { ProviderIcon } from "@/components/ui/ProviderIcon";
 import { CredentialList } from "@/components/pages/CredentialList";
 import { ACCENT_BTN_CLS, ACCENT_BUTTON_STYLE, GHOST_BTN_CLS, INPUT_CLS } from "@/components/ui/darkroom-tokens";
 import { FieldLabel } from "@/components/ui/FieldLabel";
-import type { ProviderConfigDetail, ProviderField } from "@/types";
+import type { CredentialPoolConcurrencyMode, ProviderConfigDetail, ProviderField } from "@/types";
 
 // ---------------------------------------------------------------------------
 // Status badge — Darkroom OKLCH tokens
@@ -241,6 +241,102 @@ function CapabilityPill({ kind }: { kind: string }) {
   );
 }
 
+interface PoolControlPanelProps {
+  detail: ProviderConfigDetail;
+  saving: boolean;
+  error: string | null;
+  onPatch: (patch: Record<string, string | boolean | null>) => Promise<void>;
+}
+
+function PoolControlPanel({ detail, saving, error, onPatch }: PoolControlPanelProps) {
+  const { t } = useTranslation("dashboard");
+  const enabled = detail.credential_pool_enabled ?? false;
+  const mode = detail.credential_pool_concurrency_mode ?? "shared";
+  const summary = detail.credential_pool_summary ?? {
+    enabled_credentials_count: 0,
+    active_lease_count: 0,
+  };
+  const modes: CredentialPoolConcurrencyMode[] = ["shared", "separate"];
+
+  return (
+    <section
+      aria-label={t("credential_pool_settings")}
+      className="rounded-[8px] border border-hairline p-3"
+      style={{ background: "linear-gradient(180deg, oklch(0.20 0.011 265 / 0.42), oklch(0.16 0.010 265 / 0.42))" }}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <label className="flex items-center gap-2 text-[12.5px] font-medium text-text">
+          <input
+            type="checkbox"
+            checked={enabled}
+            disabled={saving}
+            onChange={(event) => void onPatch({ credential_pool_enabled: event.currentTarget.checked })}
+            className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+          />
+          {t("credential_pool_enabled")}
+          {saving && <Loader2 className="h-3 w-3 motion-safe:animate-spin text-accent-2" aria-hidden />}
+        </label>
+        <div className="inline-flex rounded-[8px] border border-hairline-soft bg-bg-grad-a/45 p-0.5">
+          {modes.map((candidate) => {
+            const selected = mode === candidate;
+            return (
+              <button
+                key={candidate}
+                type="button"
+                aria-pressed={selected}
+                disabled={!enabled || saving || selected}
+                onClick={() => void onPatch({ credential_pool_concurrency_mode: candidate })}
+                className="rounded-[7px] px-2.5 py-1 font-mono text-[10px] font-bold uppercase tracking-[0.14em] transition-colors disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                style={selected ? { background: "var(--color-accent-dim)", color: "var(--color-accent-2)" } : { color: "var(--color-text-3)" }}
+              >
+                {candidate === "shared" ? t("credential_pool_shared") : t("credential_pool_separate")}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <div className="rounded-[7px] border border-hairline-soft bg-bg-grad-a/35 px-2.5 py-2">
+          <div className="font-mono text-[9px] font-bold uppercase tracking-[0.14em] text-text-4">{t("enabled_pool_credentials_count")}</div>
+          <div className="mt-1 font-mono text-[17px] text-text">{summary.enabled_credentials_count}</div>
+        </div>
+        <div className="rounded-[7px] border border-hairline-soft bg-bg-grad-a/35 px-2.5 py-2">
+          <div className="font-mono text-[9px] font-bold uppercase tracking-[0.14em] text-text-4">{t("active_pool_leases_count")}</div>
+          <div className="mt-1 font-mono text-[17px] text-text">{summary.active_lease_count}</div>
+        </div>
+      </div>
+      {enabled && summary.enabled_credentials_count === 0 && (
+        <p
+          className="mt-2 rounded-[7px] px-2.5 py-1.5 text-[11.5px]"
+          style={{
+            background: "var(--color-warm-tint)",
+            color: "var(--color-warm-bright)",
+            border: "1px solid var(--color-warm-ring)",
+          }}
+        >
+          {t("no_enabled_pool_credentials")}
+        </p>
+      )}
+      {enabled && summary.active_lease_count > 0 && (
+        <p className="mt-2 text-[11.5px] text-text-4">{t("active_pool_leases_hint")}</p>
+      )}
+      {error && (
+        <p
+          aria-live="polite"
+          className="mt-2 rounded-[7px] px-2.5 py-1.5 text-[11.5px]"
+          style={{
+            background: "var(--color-warm-tint)",
+            color: "var(--color-warm-bright)",
+            border: "1px solid var(--color-warm-ring)",
+          }}
+        >
+          {error}
+        </p>
+      )}
+    </section>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -255,10 +351,13 @@ export function ProviderDetail({ providerId, onSaved }: Props) {
   const [detail, setDetail] = useState<ProviderConfigDetail | null>(null);
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
+  const [savingPool, setSavingPool] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [poolSaveError, setPoolSaveError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [credentialsRefreshKey, setCredentialsRefreshKey] = useState(0);
 
   const hasDraft = Object.keys(draft).length > 0;
   useWarnUnsaved(hasDraft);
@@ -268,6 +367,27 @@ export function ProviderDetail({ providerId, onSaved }: Props) {
     setDetail(updated);
     onSaved?.();
   }, [providerId, onSaved]);
+
+  const refreshProviderAndCredentials = useCallback(async () => {
+    const updated = await API.getProviderConfig(providerId);
+    setDetail(updated);
+    setCredentialsRefreshKey((key) => key + 1);
+    onSaved?.();
+  }, [providerId, onSaved]);
+
+  const handlePoolPatch = useCallback(async (patch: Record<string, string | boolean | null>) => {
+    setSavingPool(true);
+    setPoolSaveError(null);
+    try {
+      await API.patchProviderConfig(providerId, patch);
+      await refreshProviderAndCredentials();
+    } catch (err) {
+      setPoolSaveError(errMsg(err));
+      voidCall(refreshProviderAndCredentials());
+    } finally {
+      setSavingPool(false);
+    }
+  }, [providerId, refreshProviderAndCredentials]);
 
   // 用户编辑草稿时同步清掉上一次保存失败的错误，避免旧文案滞留误导
   const handleDraftEdit = useCallback<React.Dispatch<React.SetStateAction<Record<string, string>>>>((action) => {
@@ -283,6 +403,7 @@ export function ProviderDetail({ providerId, onSaved }: Props) {
     setDetail(null);
     setLoadError(null);
     setSaveError(null);
+    setPoolSaveError(null);
     voidCall(
       API.getProviderConfig(providerId)
         .then((res) => {
@@ -389,9 +510,18 @@ export function ProviderDetail({ providerId, onSaved }: Props) {
       )}
 
       {/* Credentials */}
+      <PoolControlPanel
+        detail={detail}
+        saving={savingPool}
+        error={poolSaveError}
+        onPatch={handlePoolPatch}
+      />
       <CredentialList
         providerId={providerId}
         supportsBaseUrl={detail.supports_base_url}
+        poolEnabled={detail.credential_pool_enabled}
+        poolConcurrencyMode={detail.credential_pool_concurrency_mode}
+        refreshKey={credentialsRefreshKey}
         secretFields={detail.secret_fields}
         secretFieldGroups={detail.secret_field_groups}
         onChanged={voidPromise(handleCredentialChanged)}

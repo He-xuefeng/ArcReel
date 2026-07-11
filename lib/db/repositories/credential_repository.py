@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy import select, update
 
 from lib.config.url_utils import normalize_base_url
@@ -21,6 +23,7 @@ class CredentialRepository(BaseRepository):
         base_url: str | None = None,
         access_key: str | None = None,
         secret_key: str | None = None,
+        is_enabled: bool = False,
     ) -> ProviderCredential:
         """创建凭证。若为该供应商的第一条，自动设为活跃。"""
         is_first = not await self.has_active_credential(provider)
@@ -33,6 +36,7 @@ class CredentialRepository(BaseRepository):
             access_key=access_key,
             secret_key=secret_key,
             is_active=is_first,
+            is_enabled=is_enabled,
         )
         self.session.add(cred)
         await self.session.flush()
@@ -43,11 +47,35 @@ class CredentialRepository(BaseRepository):
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_by_id_for_provider(self, provider: str, cred_id: int) -> ProviderCredential | None:
+        stmt = select(ProviderCredential).where(
+            ProviderCredential.id == cred_id,
+            ProviderCredential.provider == provider,
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def list_by_provider(self, provider: str) -> list[ProviderCredential]:
         stmt = (
             select(ProviderCredential)
             .where(ProviderCredential.provider == provider)
             .order_by(ProviderCredential.created_at)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars())
+
+    async def list_enabled_by_provider(self, provider: str) -> list[ProviderCredential]:
+        stmt = (
+            select(ProviderCredential)
+            .where(
+                ProviderCredential.provider == provider,
+                ProviderCredential.is_enabled == True,  # noqa: E712
+            )
+            .order_by(
+                ProviderCredential.last_leased_at.is_not(None),
+                ProviderCredential.last_leased_at,
+                ProviderCredential.id,
+            )
         )
         result = await self.session.execute(stmt)
         return list(result.scalars())
@@ -90,6 +118,7 @@ class CredentialRepository(BaseRepository):
         base_url: str | None | object = _UNSET,
         access_key: str | None = None,
         secret_key: str | None = None,
+        is_enabled: bool | None = None,
     ) -> None:
         """更新凭证字段。仅更新非 None 参数（base_url 用 _UNSET 表示未传入）。"""
         cred = await self.get_by_id(cred_id)
@@ -107,6 +136,13 @@ class CredentialRepository(BaseRepository):
             cred.access_key = access_key
         if secret_key is not None:
             cred.secret_key = secret_key
+        if is_enabled is not None:
+            cred.is_enabled = is_enabled
+
+    async def touch_last_leased(self, cred_id: int, leased_at: datetime) -> None:
+        await self.session.execute(
+            update(ProviderCredential).where(ProviderCredential.id == cred_id).values(last_leased_at=leased_at)
+        )
 
     async def delete(self, cred_id: int) -> None:
         """删除凭证。若删除的是活跃凭证，自动将最早的另一条设为活跃。"""

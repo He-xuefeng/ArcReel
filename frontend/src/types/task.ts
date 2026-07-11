@@ -30,6 +30,10 @@ export interface TaskItem {
   cancelled_by: "user" | "cascade" | null;
   provider_id: string | null;
   provider_job_id: string | null;
+  credential_id?: number | null;
+  credential_name?: string | null;
+  credential_label?: string | null;
+  wait_reason?: string | null;
   source: "webui" | "agent";
   queued_at: string;
   started_at: string | null;

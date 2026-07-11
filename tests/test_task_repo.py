@@ -372,6 +372,126 @@ class TestTaskRepository:
         assert stats["cancelled"] == 1
         assert stats["queued"] == 0
 
+    async def test_task_dict_includes_credential_and_wait_reason(self, db_session):
+        repo = TaskRepository(db_session)
+        task = await repo.enqueue(
+            project_name="demo",
+            task_type="storyboard",
+            media_type="image",
+            resource_id="E1S01",
+            payload={},
+            script_file="ep1.json",
+        )
+        await repo.mark_waiting_for_credential("gemini-aistudio", "image")
+        fetched = await repo.get(task["task_id"])
+        assert fetched["credential_id"] is None
+        assert fetched["wait_reason"] is None
+
+    async def test_mark_waiting_for_credential_marks_matching_queued_tasks(self, db_session):
+        repo = TaskRepository(db_session)
+        t1 = await repo.enqueue(
+            project_name="demo",
+            task_type="storyboard",
+            media_type="image",
+            resource_id="E1S01",
+            payload={},
+            script_file="ep1.json",
+            provider_id="gemini-aistudio",
+        )
+        t2 = await repo.enqueue(
+            project_name="demo",
+            task_type="video",
+            media_type="video",
+            resource_id="E1S02",
+            payload={},
+            script_file="ep1.json",
+            provider_id="gemini-aistudio",
+        )
+
+        assert await repo.mark_waiting_for_credential("gemini-aistudio", "image") == 1
+        assert (await repo.get(t1["task_id"]))["wait_reason"] == "waiting_for_credential"
+        assert (await repo.get(t2["task_id"]))["wait_reason"] is None
+
+    async def test_claim_next_clears_wait_reason(self, db_session):
+        repo = TaskRepository(db_session)
+        task = await repo.enqueue(
+            project_name="demo",
+            task_type="storyboard",
+            media_type="image",
+            resource_id="E1S01",
+            payload={},
+            script_file="ep1.json",
+            provider_id="gemini-aistudio",
+        )
+        await repo.mark_waiting_for_credential("gemini-aistudio", "image")
+
+        running = await repo.claim_next("image")
+        assert running["task_id"] == task["task_id"]
+        assert running["wait_reason"] is None
+
+    async def test_requeue_for_credential_wait_moves_running_back_to_queued(self, db_session):
+        repo = TaskRepository(db_session)
+        task = await repo.enqueue(
+            project_name="demo",
+            task_type="storyboard",
+            media_type="image",
+            resource_id="E1S01",
+            payload={},
+            script_file="ep1.json",
+        )
+        await repo.claim_next("image")
+
+        assert await repo.requeue_for_credential_wait(task["task_id"], "waiting_for_credential") == 1
+        queued = await repo.get(task["task_id"])
+        assert queued["status"] == "queued"
+        assert queued["started_at"] is None
+        assert queued["wait_reason"] == "waiting_for_credential"
+
+    async def test_clear_wait_reason(self, db_session):
+        repo = TaskRepository(db_session)
+        task = await repo.enqueue(
+            project_name="demo",
+            task_type="storyboard",
+            media_type="image",
+            resource_id="E1S01",
+            payload={},
+            script_file="ep1.json",
+            provider_id="gemini-aistudio",
+        )
+        await repo.mark_waiting_for_credential("gemini-aistudio", "image")
+        await repo.clear_wait_reason(task["task_id"])
+        assert (await repo.get(task["task_id"]))["wait_reason"] is None
+
+    async def test_persist_provider_job_binding_updates_task_and_binding(self, db_session):
+        from lib.db.repositories.credential_repository import CredentialRepository
+        from lib.db.repositories.provider_job_binding_repository import ProviderJobBindingRepository
+
+        credential = await CredentialRepository(db_session).create("gemini-aistudio", "key", api_key="1")
+        repo = TaskRepository(db_session)
+        task = await repo.enqueue(
+            project_name="demo",
+            task_type="video",
+            media_type="video",
+            resource_id="E1S01",
+            payload={},
+            script_file="ep1.json",
+        )
+
+        await repo.persist_provider_job_binding(
+            task_id=task["task_id"],
+            provider="gemini-aistudio",
+            provider_job_id="job-1",
+            credential_id=credential.id,
+            media_type="video",
+            model_id="veo",
+        )
+        updated = await repo.get(task["task_id"])
+        binding = await ProviderJobBindingRepository(db_session).get_by_task(task["task_id"])
+        assert updated["provider_job_id"] == "job-1"
+        assert updated["credential_id"] == credential.id
+        assert binding is not None
+        assert binding.credential_id == credential.id
+
 
 class TestPersistApiCallId:
     """persist_api_call_id：read-modify-write 写入 task.payload["api_call_id"]。"""

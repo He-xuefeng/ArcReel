@@ -210,6 +210,73 @@ class TestTextToVideo:
         fake_download.assert_called_once()
         assert fake_download.call_args.args[0] == "https://cdn.agnes/out.mp4"
 
+    async def test_submit_video_id_takes_priority_for_polling(self, tmp_path: Path):
+        create_resp = _make_response(
+            200,
+            {
+                "video_id": "video-provider-42",
+                "task_id": "task-provider-42",
+                "id": "id-provider-42",
+                "status": "queued",
+            },
+        )
+        poll_resp = _make_response(200, _completed("video-provider-42", "https://cdn.agnes/video-id.mp4"))
+
+        client = _mock_client(
+            post=AsyncMock(return_value=create_resp),
+            get=AsyncMock(return_value=poll_resp),
+        )
+        fake_download = AsyncMock(side_effect=_fake_download_factory(b"v"))
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch("lib.video_backends.agnes._POLL_INTERVAL_SECONDS", 0.0),
+            patch("lib.video_backends.agnes.download_video", fake_download),
+        ):
+            from lib.video_backends.agnes import AgnesVideoBackend
+
+            backend = AgnesVideoBackend(api_key="k", base_url="https://x/v1")
+            result = await backend.generate(
+                VideoGenerationRequest(
+                    prompt="p", output_path=tmp_path / "o.mp4", aspect_ratio="9:16", duration_seconds=5
+                )
+            )
+
+        assert client.get.call_args.args[0] == "https://x/agnesapi"
+        assert client.get.call_args.kwargs["params"] == {"video_id": "video-provider-42"}
+        assert result.task_id == "video-provider-42"
+        assert result.video_uri == "https://cdn.agnes/video-id.mp4"
+
+    async def test_poll_falls_back_to_legacy_videos_endpoint_on_404(self, tmp_path: Path):
+        create_resp = _make_response(200, {"video_id": "video-provider-404", "status": "queued"})
+        query_not_found = _make_response(404, {"error": "not found"})
+        legacy_completed = _make_response(200, _completed("video-provider-404", "https://cdn.agnes/legacy.mp4"))
+        client = _mock_client(
+            post=AsyncMock(return_value=create_resp),
+            get=AsyncMock(side_effect=[query_not_found, legacy_completed]),
+        )
+        fake_download = AsyncMock(side_effect=_fake_download_factory(b"v"))
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch("lib.video_backends.agnes._POLL_INTERVAL_SECONDS", 0.0),
+            patch("lib.video_backends.agnes.download_video", fake_download),
+        ):
+            from lib.video_backends.agnes import AgnesVideoBackend
+
+            backend = AgnesVideoBackend(api_key="k", base_url="https://x/v1")
+            result = await backend.generate(
+                VideoGenerationRequest(
+                    prompt="p", output_path=tmp_path / "o.mp4", aspect_ratio="9:16", duration_seconds=5
+                )
+            )
+
+        first_call, second_call = client.get.call_args_list
+        assert first_call.args[0] == "https://x/agnesapi"
+        assert first_call.kwargs["params"] == {"video_id": "video-provider-404"}
+        assert second_call.args[0] == "https://x/v1/videos/video-provider-404"
+        assert result.video_uri == "https://cdn.agnes/legacy.mp4"
+
     async def test_polls_through_in_progress(self, tmp_path: Path):
         create_resp = _make_response(200, {"task_id": "t3", "status": "queued"})
         in_progress = _make_response(200, {"task_id": "t3", "status": "in_progress", "progress": 40})
@@ -697,6 +764,78 @@ class TestFailureAndTimeout:
             == "https://platform-outputs.agnes-ai.space/videos/agnes-video-v2.0/video_abc.mp4"
         )
 
+    async def test_metadata_url_falls_back_when_top_level_url_fields_are_missing(self, tmp_path: Path):
+        """真实响应兼容：completed 把成片 URL 放在 metadata.url。"""
+        create_resp = _make_response(200, {"task_id": "t-video-id", "status": "queued"})
+        poll_resp = _make_response(
+            200,
+            {
+                "task_id": "t-video-id",
+                "status": "completed",
+                "video_id": "t-video-id",
+                "metadata": {"url": "https://platform-outputs.agnes-ai.space/videos/agnes-video-v2.0/video_only.mp4"},
+            },
+        )
+        client = _mock_client(
+            post=AsyncMock(return_value=create_resp),
+            get=AsyncMock(return_value=poll_resp),
+        )
+        fake_download = AsyncMock(side_effect=_fake_download_factory(b"v"))
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch("lib.video_backends.agnes._POLL_INTERVAL_SECONDS", 0.0),
+            patch("lib.video_backends.agnes.download_video", fake_download),
+        ):
+            from lib.video_backends.agnes import AgnesVideoBackend
+
+            backend = AgnesVideoBackend(api_key="k", base_url="https://x/v1")
+            result = await backend.generate(
+                VideoGenerationRequest(
+                    prompt="p", output_path=tmp_path / "o.mp4", aspect_ratio="9:16", duration_seconds=5
+                )
+            )
+
+        assert result.video_uri == "https://platform-outputs.agnes-ai.space/videos/agnes-video-v2.0/video_only.mp4"
+        fake_download.assert_called_once()
+        assert (
+            fake_download.call_args.args[0]
+            == "https://platform-outputs.agnes-ai.space/videos/agnes-video-v2.0/video_only.mp4"
+        )
+
+    async def test_plain_video_id_is_not_treated_as_download_url(self, tmp_path: Path):
+        """video_id 通常是 task id；没有明确 URL 字段时应继续 fail-loud。"""
+        create_resp = _make_response(200, {"task_id": "t-video-id-only", "status": "queued"})
+        poll_resp = _make_response(
+            200,
+            {
+                "task_id": "t-video-id-only",
+                "status": "completed",
+                "video_id": "t-video-id-only",
+            },
+        )
+        client = _mock_client(
+            post=AsyncMock(return_value=create_resp),
+            get=AsyncMock(return_value=poll_resp),
+        )
+        fake_download = AsyncMock()
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch("lib.video_backends.agnes._POLL_INTERVAL_SECONDS", 0.0),
+            patch("lib.video_backends.agnes.download_video", fake_download),
+        ):
+            from lib.video_backends.agnes import AgnesVideoBackend
+
+            backend = AgnesVideoBackend(api_key="k", base_url="https://x/v1")
+            with pytest.raises(RuntimeError, match="缺少成片 URL"):
+                await backend.generate(
+                    VideoGenerationRequest(
+                        prompt="p", output_path=tmp_path / "o.mp4", aspect_ratio="9:16", duration_seconds=5
+                    )
+                )
+        fake_download.assert_not_called()
+
     async def test_polling_timeout_raises(self, tmp_path: Path):
         create_resp = _make_response(200, {"task_id": "t-timeout", "status": "queued"})
         in_progress = _make_response(200, {"task_id": "t-timeout", "status": "in_progress"})
@@ -830,7 +969,8 @@ class TestResume:
             )
 
         client.post.assert_not_called()
-        assert client.get.call_args.args[0].endswith("/videos/task-resume")
+        assert client.get.call_args.args[0] == "https://x/agnesapi"
+        assert client.get.call_args.kwargs["params"] == {"video_id": "task-resume"}
         assert result.task_id == "task-resume"
         assert (tmp_path / "out.mp4").read_bytes() == b"resumed"
 
@@ -855,7 +995,11 @@ class TestResume:
                 )
             assert ei.value.job_id == "task-404"
             assert ei.value.provider == PROVIDER_AGNES
-            assert client.get.call_count == 1
+            assert client.get.call_count == 2
+            first_call, second_call = client.get.call_args_list
+            assert first_call.args[0] == "https://x/agnesapi"
+            assert first_call.kwargs["params"] == {"video_id": "task-404"}
+            assert second_call.args[0] == "https://x/v1/videos/task-404"
 
 
 class TestDurationValidation:
@@ -879,8 +1023,8 @@ class TestDurationValidation:
 
 
 class TestProviderJobIdPersistence:
-    async def test_persists_agnes_task_id_for_worker_request(self, tmp_path: Path):
-        """worker 路径（request.task_id 非空）下，submit 返回的 Agnes task_id 作为 job_id 写回，覆盖 resume 契约。"""
+    async def test_persists_agnes_provider_job_id_for_worker_request(self, tmp_path: Path):
+        """worker 路径（request.task_id 非空）下，submit 返回的 provider job id 写回，覆盖 resume 契约。"""
         create_resp = _make_response(200, {"task_id": "agnes-task-42", "status": "queued"})
         poll_resp = _make_response(200, _completed("agnes-task-42"))
         client = _mock_client(
@@ -912,7 +1056,7 @@ class TestProviderJobIdPersistence:
         persist.assert_awaited_once()
         args, kwargs = persist.call_args
         assert args[0] == "worker-task-99"  # worker 任务 id
-        assert args[1] == "agnes-task-42"  # Agnes submit 返回的 task_id 作为 job_id 写回
+        assert args[1] == "agnes-task-42"  # Agnes submit 返回的 provider job id 写回
         assert kwargs["provider"] == PROVIDER_AGNES
 
     async def test_non_worker_request_skips_persistence(self, tmp_path: Path):

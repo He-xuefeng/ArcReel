@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -43,6 +44,12 @@ class _FakeQueue:
         self._succeeded_rows = succeeded_rows
         self._failed_rows = failed_rows
         self._orphans: list[dict] = []
+        self.full_credential_pool_providers: dict[str, frozenset[str]] = {}
+        self.full_provider_queries: list[str] = []
+        self.waiting_marks: list[tuple[str, str]] = []
+        self.credential_releases: list[tuple[str, str]] = []
+        self.recover_calls: list[int] = []
+        self.provider_job_bindings_by_task: dict[str, dict[str, Any]] = {}
 
     async def acquire_or_renew_worker_lease(self, name, owner_id, ttl_seconds):
         self._lease_calls += 1
@@ -58,6 +65,40 @@ class _FakeQueue:
         return self._orphans
 
     async def claim_next_task(self, media_type, **_kwargs):
+        return None
+
+    async def find_full_credential_pool_providers(self, media_type, providers=None):
+        self.full_provider_queries.append(media_type)
+        return self.full_credential_pool_providers.get(media_type, frozenset())
+
+    async def mark_waiting_for_credential(self, provider_id, media_type, limit=200):
+        self.waiting_marks.append((provider_id, media_type))
+        return 1
+
+    async def acquire_credential_lease(self, *, provider, media_type, task_id, owner_id):
+        return SimpleNamespace(acquired=False, credential_id=None, reason="pool_disabled")
+
+    async def requeue_for_credential_wait(self, task_id, reason):
+        return 1
+
+    async def bind_active_credential_for_task(self, *, task_id, provider):
+        return None
+
+    async def release_credential_lease(self, *, task_id, reason):
+        self.credential_releases.append((task_id, reason))
+        return True
+
+    async def recover_credential_leases(self, *, limit=500):
+        self.recover_calls.append(limit)
+        return 0
+
+    async def get_provider_job_binding_by_task(self, task_id):
+        return self.provider_job_bindings_by_task.get(task_id)
+
+    async def get_provider_job_binding(self, *, provider, provider_job_id):
+        for binding in self.provider_job_bindings_by_task.values():
+            if binding.get("provider") == provider and binding.get("provider_job_id") == provider_job_id:
+                return binding
         return None
 
     async def mark_task_succeeded(self, task_id, result):
@@ -892,6 +933,28 @@ class TestGenerationWorker:
         assert worker._main_task is None
 
     @pytest.mark.asyncio
+    async def test_run_loop_recovers_credential_leases_after_acquiring_worker_lease(self, monkeypatch):
+        queue = _FakeQueue()
+        worker = GenerationWorker(queue=queue)
+        worker.heartbeat_interval = 0.01
+        worker.poll_interval = 0.01
+
+        async def _no_orphans(self):
+            return None
+
+        monkeypatch.setattr(GenerationWorker, "_handle_orphan_tasks_on_start", _no_orphans)
+
+        await worker.start()
+        for _ in range(50):
+            if queue.recover_calls:
+                break
+            await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(worker.stop(), timeout=2.0)
+
+        assert queue.recover_calls == [500]
+
+    @pytest.mark.asyncio
     async def test_claim_tasks_dispatches_to_correct_pool(self, monkeypatch):
         """Tasks are dispatched to the correct provider slot."""
 
@@ -942,6 +1005,199 @@ class TestGenerationWorker:
 
         # Wait for tasks to complete
         await asyncio.gather(*worker._slots.all_active_tasks(), return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_claim_tasks_filters_full_credential_pools_before_claim(self, monkeypatch):
+        """凭证池满 provider 在 claim 前被标记等待并传入 SQL 黑名单。"""
+
+        class _CredentialFullQueue(_FakeQueue):
+            def __init__(self):
+                super().__init__()
+                self.full_credential_pool_providers = {"image": frozenset({"gemini-aistudio"})}
+                self.claim_filters: list[frozenset[str] | None] = []
+                self._tasks = [
+                    {
+                        "task_id": "img-openai",
+                        "task_type": "gen_image",
+                        "media_type": "image",
+                        "payload": {"image_provider": "openai"},
+                    }
+                ]
+
+            async def claim_next_task(self, media_type, **kwargs):  # type: ignore[override]
+                self.claim_filters.append(kwargs.get("pool_full_providers"))
+                if media_type != "image":
+                    return None
+                pool_full = kwargs.get("pool_full_providers") or frozenset()
+                for i, task in enumerate(self._tasks):
+                    provider_id = task["payload"].get("image_provider")
+                    if provider_id not in pool_full:
+                        return self._tasks.pop(i)
+                return None
+
+        queue = _CredentialFullQueue()
+        worker = GenerationWorker(
+            queue=queue,
+            capacity=_cap({"gemini-aistudio": {"image": 3, "video": 2}, "openai": {"image": 3, "video": 0}}),
+        )
+
+        async def _fake_execute(task):
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "server.services.generation_tasks.execute_generation_task",
+            _fake_execute,
+        )
+
+        claimed = await worker._claim_tasks()
+
+        assert claimed is True
+        assert queue.full_provider_queries.count("image") == 1
+        assert ("gemini-aistudio", "image") in queue.waiting_marks
+        assert any(filters and "gemini-aistudio" in filters for filters in queue.claim_filters)
+        assert worker._slots.find_by_task("img-openai") is not None
+        assert worker._slots.find_by_task("img-gemini") is None
+
+        await asyncio.gather(*worker._slots.all_active_tasks(), return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_claim_tasks_acquires_credential_before_registering_slot(self, monkeypatch):
+        """池化开启时必须先租赁成功，再登记 SlotTable 并执行任务。"""
+
+        class _LeaseQueue(_FakeQueue):
+            def __init__(self):
+                super().__init__()
+                self.acquired: list[tuple[str, str, str, str]] = []
+                self._claimed = False
+
+            async def claim_next_task(self, media_type, **kwargs):  # type: ignore[override]
+                if media_type == "image" and not self._claimed:
+                    self._claimed = True
+                    return {
+                        "task_id": "img-pooled",
+                        "task_type": "gen_image",
+                        "media_type": "image",
+                        "payload": {"image_provider": "gemini-aistudio"},
+                    }
+                return None
+
+            async def acquire_credential_lease(self, *, provider, media_type, task_id, owner_id):  # type: ignore[override]
+                self.acquired.append((provider, media_type, task_id, owner_id))
+                return SimpleNamespace(acquired=True, credential_id=42, reason=None)
+
+        queue = _LeaseQueue()
+        worker = GenerationWorker(
+            queue=queue,
+            capacity=_cap({"gemini-aistudio": {"image": 3, "video": 2}}),
+        )
+
+        seen_credentials: list[int | None] = []
+
+        async def _fake_execute(task):
+            seen_credentials.append(task.get("credential_id"))
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "server.services.generation_tasks.execute_generation_task",
+            _fake_execute,
+        )
+
+        assert await worker._claim_tasks() is True
+        assert queue.acquired == [("gemini-aistudio", "image", "img-pooled", worker.owner_id)]
+        assert worker._slots.find_by_task("img-pooled") is not None
+
+        await asyncio.gather(*worker._slots.all_active_tasks(), return_exceptions=True)
+        assert seen_credentials == [42]
+
+    @pytest.mark.asyncio
+    async def test_claim_tasks_binds_active_credential_for_video_when_pool_disabled(self, monkeypatch):
+        """池化关闭的视频任务在 submit 前绑定当时 active credential。"""
+
+        class _PoolDisabledVideoQueue(_FakeQueue):
+            def __init__(self):
+                super().__init__()
+                self._claimed = False
+                self.bound: list[tuple[str, str]] = []
+
+            async def claim_next_task(self, media_type, **kwargs):  # type: ignore[override]
+                if media_type == "video" and not self._claimed:
+                    self._claimed = True
+                    return {
+                        "task_id": "vid-active",
+                        "task_type": "video",
+                        "media_type": "video",
+                        "payload": {"video_provider": "ark"},
+                    }
+                return None
+
+            async def acquire_credential_lease(self, *, provider, media_type, task_id, owner_id):  # type: ignore[override]
+                return SimpleNamespace(acquired=False, credential_id=None, reason="pool_disabled")
+
+            async def bind_active_credential_for_task(self, *, task_id, provider):  # type: ignore[override]
+                self.bound.append((task_id, provider))
+                return 7
+
+        queue = _PoolDisabledVideoQueue()
+        worker = GenerationWorker(queue=queue, capacity=_cap({"ark": {"image": 0, "video": 2}}))
+        seen_credentials: list[int | None] = []
+
+        async def _fake_execute(task):
+            seen_credentials.append(task.get("credential_id"))
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "server.services.generation_tasks.execute_generation_task",
+            _fake_execute,
+        )
+
+        assert await worker._claim_tasks() is True
+        assert queue.bound == [("vid-active", "ark")]
+
+        await asyncio.gather(*worker._slots.all_active_tasks(), return_exceptions=True)
+        assert seen_credentials == [7]
+
+    @pytest.mark.asyncio
+    async def test_claim_tasks_requeues_when_credential_lease_fails(self, monkeypatch):
+        """claim 后租赁失败：任务回队、本轮加入黑名单、不登记 SlotTable。"""
+
+        class _LeaseFailQueue(_FakeQueue):
+            def __init__(self):
+                super().__init__()
+                self.claim_filters: list[frozenset[str] | None] = []
+                self.requeued: list[tuple[str, str]] = []
+                self._first_claim = True
+
+            async def claim_next_task(self, media_type, **kwargs):  # type: ignore[override]
+                self.claim_filters.append(kwargs.get("pool_full_providers"))
+                if media_type != "image":
+                    return None
+                if self._first_claim:
+                    self._first_claim = False
+                    return {
+                        "task_id": "img-race",
+                        "task_type": "gen_image",
+                        "media_type": "image",
+                        "payload": {"image_provider": "gemini-aistudio"},
+                    }
+                return None
+
+            async def acquire_credential_lease(self, *, provider, media_type, task_id, owner_id):  # type: ignore[override]
+                return SimpleNamespace(acquired=False, credential_id=None, reason="waiting_for_credential")
+
+            async def requeue_for_credential_wait(self, task_id, reason):  # type: ignore[override]
+                self.requeued.append((task_id, reason))
+                return 1
+
+        queue = _LeaseFailQueue()
+        worker = GenerationWorker(
+            queue=queue,
+            capacity=_cap({"gemini-aistudio": {"image": 3, "video": 2}}),
+        )
+
+        assert await worker._claim_tasks() is False
+        assert queue.requeued == [("img-race", "waiting_for_credential")]
+        assert worker._slots.find_by_task("img-race") is None
+        assert any(filters and "gemini-aistudio" in filters for filters in queue.claim_filters)
 
     # ------------------------------------------------------------------
     # _pool_full_providers
@@ -1339,9 +1595,17 @@ class TestGenerationWorker:
     # _process_resume_task：分流 + provider 锁定
     # ------------------------------------------------------------------
     @pytest.mark.asyncio
-    async def test_process_resume_task_locks_persisted_provider_to_payload(self, monkeypatch):
-        """C2 回归：persisted provider_id 应注入 payload.video_provider。"""
+    async def test_process_resume_task_uses_provider_job_binding(self, monkeypatch):
+        """binding 存在时按绑定的 provider/model/credential resume，不重新走 active。"""
         queue = _FakeQueue()
+        queue.provider_job_bindings_by_task["resume-locked"] = {
+            "task_id": "resume-locked",
+            "provider": "openai",
+            "provider_job_id": "binding-job",
+            "credential_id": 77,
+            "media_type": "video",
+            "model_id": "sora-2",
+        }
         worker = GenerationWorker(queue=queue)
         captured_task: dict | None = None
         captured_job_id: str | None = None
@@ -1365,10 +1629,45 @@ class TestGenerationWorker:
         }
         await worker._process_resume_task(task)
         assert captured_task is not None
-        # _process_resume_task 应覆写为持久化 provider_id (openai)
+        # binding 应覆盖 payload 原值和 tasks.provider_id 原值。
         assert captured_task["payload"]["video_provider"] == "openai"
-        assert captured_job_id == "openai-job"
+        assert captured_task["payload"]["video_model"] == "sora-2"
+        assert captured_task["provider_id"] == "openai"
+        assert captured_task["credential_id"] == 77
+        assert captured_job_id == "binding-job"
         assert queue.succeeded == [("resume-locked", {"ok": True})]
+        assert queue.credential_releases == [("resume-locked", "succeeded")]
+
+    @pytest.mark.asyncio
+    async def test_process_resume_task_missing_binding_warns_and_uses_legacy_provider(self, monkeypatch, caplog):
+        """没有 binding 的历史任务只告警，继续按 tasks.provider_id 走 active 兼容。"""
+        queue = _FakeQueue()
+        worker = GenerationWorker(queue=queue)
+        captured_task: dict | None = None
+
+        async def _fake_resume(task, *, job_id):
+            nonlocal captured_task
+            captured_task = task
+            assert job_id == "openai-job"
+            return {"ok": True}
+
+        monkeypatch.setattr("server.services.resume_executor.execute_resume_video_task", _fake_resume)
+        task = {
+            "task_id": "legacy-resume",
+            "task_type": "video",
+            "media_type": "video",
+            "provider_id": "openai",
+            "provider_job_id": "openai-job",
+            "payload": {"video_provider": "gemini-aistudio"},
+            "project_name": "demo",
+        }
+        with caplog.at_level("WARNING"):
+            await worker._process_resume_task(task)
+
+        assert captured_task is not None
+        assert captured_task["payload"]["video_provider"] == "openai"
+        assert captured_task.get("credential_id") is None
+        assert "[credential_binding_missing]" in caplog.text
 
     @pytest.mark.asyncio
     async def test_process_resume_task_resume_expired(self, monkeypatch):
@@ -1481,6 +1780,63 @@ class TestGenerationWorker:
         await worker._process_resume_task(task)
         assert queue.failed and queue.failed[0][0] == "no-job"
         assert "[restart_lost_resume_no_job_id]" in queue.failed[0][1]
+
+    @pytest.mark.asyncio
+    async def test_process_task_releases_credential_lease_on_success(self, monkeypatch):
+        queue = _FakeQueue()
+        worker = GenerationWorker(queue=queue)
+
+        async def _fake_execute(task):
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "server.services.generation_tasks.execute_generation_task",
+            _fake_execute,
+        )
+
+        await worker._process_task({"task_id": "done", "task_type": "storyboard", "payload": {}})
+
+        assert queue.succeeded and queue.succeeded[0][0] == "done"
+        assert queue.credential_releases == [("done", "succeeded")]
+
+    @pytest.mark.asyncio
+    async def test_process_task_releases_credential_lease_on_failure(self, monkeypatch):
+        queue = _FakeQueue()
+        worker = GenerationWorker(queue=queue)
+
+        async def _fake_execute(task):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "server.services.generation_tasks.execute_generation_task",
+            _fake_execute,
+        )
+
+        await worker._process_task({"task_id": "failed", "task_type": "storyboard", "payload": {}})
+
+        assert queue.failed and queue.failed[0][0] == "failed"
+        assert queue.credential_releases == [("failed", "failed")]
+
+    @pytest.mark.asyncio
+    async def test_credential_lease_release_failure_does_not_override_terminal_status(self, monkeypatch):
+        class _ReleaseFailQueue(_FakeQueue):
+            async def release_credential_lease(self, *, task_id, reason):  # type: ignore[override]
+                raise RuntimeError("db down")
+
+        queue = _ReleaseFailQueue()
+        worker = GenerationWorker(queue=queue)
+
+        async def _fake_execute(task):
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "server.services.generation_tasks.execute_generation_task",
+            _fake_execute,
+        )
+
+        await worker._process_task({"task_id": "done-release-fail", "task_type": "storyboard", "payload": {}})
+
+        assert queue.succeeded and queue.succeeded[0][0] == "done-release-fail"
 
 
 class TestDispatcherFailFastAndPendingTracking:

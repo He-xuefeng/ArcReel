@@ -40,20 +40,54 @@ _PERSIST_BACKOFF_SECONDS: tuple[int, ...] = (1, 2, 4)
     backoff_seconds=_PERSIST_BACKOFF_SECONDS,
     retry_if=lambda e: isinstance(e, _PERSIST_RETRYABLE_ERRORS),
 )
-async def _persist_with_retry(task_id: str, job_id: str) -> None:
+async def _persist_with_retry(
+    task_id: str,
+    job_id: str,
+    *,
+    provider: str,
+    credential_id: int | None,
+    media_type: str,
+    model_id: str | None,
+) -> None:
     from lib.generation_queue import get_generation_queue
 
-    await get_generation_queue().persist_provider_job_id(task_id, job_id)
+    queue = get_generation_queue()
+    if credential_id is None:
+        await queue.persist_provider_job_id(task_id, job_id)
+        return
+    await queue.persist_provider_job_binding(
+        task_id=task_id,
+        provider=provider,
+        provider_job_id=job_id,
+        credential_id=credential_id,
+        media_type=media_type,
+        model_id=model_id,
+    )
 
 
-async def persist_provider_job_id(task_id: str, job_id: str, *, provider: str) -> None:
+async def persist_provider_job_id(
+    task_id: str,
+    job_id: str,
+    *,
+    provider: str,
+    credential_id: int | None = None,
+    media_type: str = "video",
+    model_id: str | None = None,
+) -> None:
     """Submit 之后立即调：把 job_id 持久化到 DB 让重启可接续。
 
     Caller 显式传 task_id；DB 瞬态错误最多重试 3 次，业务异常立即抛。
     重试用尽抛异常，由 worker finally 兜底 mark_failed（fail-fast）。
     """
     try:
-        await _persist_with_retry(task_id, job_id)
+        await _persist_with_retry(
+            task_id,
+            job_id,
+            provider=provider,
+            credential_id=credential_id,
+            media_type=media_type,
+            model_id=model_id,
+        )
         logger.info("provider_job_id 已持久化 task_id=%s provider=%s job_id=%s", task_id, provider, job_id)
     except Exception as exc:
         logger.error(
@@ -87,7 +121,14 @@ class ProviderJobIdPersistenceMixin:
         """
         if request.task_id is None:
             return
-        await persist_provider_job_id(request.task_id, job_id, provider=provider)
+        await persist_provider_job_id(
+            request.task_id,
+            job_id,
+            provider=provider,
+            credential_id=request.credential_id,
+            media_type="video",
+            model_id=request.model_id,
+        )
 
 
 @with_retry_async(
@@ -426,6 +467,8 @@ class VideoGenerationRequest:
     # `ProviderJobIdPersistenceMixin._persist_provider_job_id` 持久化 job_id。
     # 非 worker 路径（grid / 直生 / 测试）保持 None，统一点据此跳过持久化。
     task_id: str | None = None
+    credential_id: int | None = None
+    model_id: str | None = None
 
     # Seedance 特有
     service_tier: str = "default"

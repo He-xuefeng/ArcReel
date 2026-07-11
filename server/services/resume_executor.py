@@ -42,6 +42,7 @@ async def execute_resume_video_task(task: dict[str, Any], *, job_id: str) -> dic
     task_id = task["task_id"]
     payload = task.get("payload") or {}
     user_id = task.get("user_id", DEFAULT_USER_ID)
+    credential_id = task.get("credential_id")
 
     if task_type not in ("video", "reference_video"):
         raise NotImplementedError(f"resume not supported for task_type={task_type}")
@@ -60,6 +61,7 @@ async def execute_resume_video_task(task: dict[str, Any], *, job_id: str) -> dic
         payload=payload,
         user_id=user_id,
         require_image_backend=False,
+        credential_id=credential_id if isinstance(credential_id, int) else None,
     )
 
     aspect_ratio = get_aspect_ratio(project, "videos") if task_type == "video" else project.get("aspect_ratio", "9:16")

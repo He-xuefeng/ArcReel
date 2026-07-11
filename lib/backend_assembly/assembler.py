@@ -18,14 +18,19 @@ if TYPE_CHECKING:
     from lib.config.resolver import ConfigResolver
 
 
-async def _load_builtin_config(resolver: ConfigResolver, provider_id: str, rate_limiter: Any | None) -> LoadedConfig:
+async def _load_builtin_config(
+    resolver: ConfigResolver,
+    provider_id: str,
+    rate_limiter: Any | None,
+    credential_id: int | None,
+) -> LoadedConfig:
     """内置侧 async 装载段：查 DB/config 产出 LoadedConfig 信封。
 
     凭证 overlay 来自 db_config（resolver.provider_config）；registry meta 提供 default_base_url /
     api_model_name 来源；rate_limiter 由调用方注入（共享实例）。这一段是唯一的 await/DB 触点，
     之后 sync 构造闭包只读信封。
     """
-    db_config = await resolver.provider_config(provider_id)
+    db_config = await resolver.provider_config(provider_id, credential_id=credential_id)
     return LoadedConfig(
         credentials=dict(db_config),
         provider_meta=PROVIDER_REGISTRY.get(provider_id),
@@ -40,6 +45,7 @@ async def assemble_backend(
     model_id: str | None,
     resolver: ConfigResolver,
     rate_limiter: Any | None = None,
+    credential_id: int | None = None,
 ) -> Any:
     """统一构造入口。按 provider_id 是否自定义分流；未登记的内置 provider × media fail-loud。"""
     if is_custom_provider(provider_id):
@@ -52,5 +58,5 @@ async def assemble_backend(
                 session=session, provider_id=provider_id, model_id=model_id, media_type=media_type
             )
     spec = get_provider_spec(provider_id, media_type)  # 未登记 → ValueError（fail-loud）
-    config = await _load_builtin_config(resolver, provider_id, rate_limiter)
+    config = await _load_builtin_config(resolver, provider_id, rate_limiter, credential_id)
     return spec.build_backend(config, model_id)

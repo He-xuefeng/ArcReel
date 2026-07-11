@@ -27,6 +27,7 @@ from datetime import UTC
 # 不触发。lease_ttl 默认 10s → 阈值 30s。常量化便于单测注入与未来调参。
 _ORPHAN_RESCAN_LEASE_LOST_MULT = 3
 
+from lib.custom_provider import is_custom_provider
 from lib.generation_queue import (
     TASK_POLL_INTERVAL_SEC,
     TASK_WORKER_HEARTBEAT_SEC,
@@ -466,6 +467,12 @@ class GenerationWorker:
                 # 一次性扫描：进程持 lease 后只扫一次 orphan；后续主循环不再重扫。
                 # 单 lease 互斥保证不会与另一个 worker 同时扫；跨进程接管由上述阈值兜底。
                 if self._owns_lease and not self._orphan_handled_once:
+                    try:
+                        recovered = await self.queue.recover_credential_leases(limit=500)
+                        if recovered:
+                            logger.info("恢复释放 %d 条遗留 credential lease", recovered)
+                    except Exception:
+                        logger.warning("恢复 credential lease 失败", exc_info=True)
                     await self._handle_orphan_tasks_on_start()
                     self._orphan_handled_once = True
 
@@ -509,15 +516,33 @@ class GenerationWorker:
 
         池满 task 不再 claim → requeue 反复刷屏；改为在 SQL 层按
         ``pool_full_providers`` 黑名单过滤，池满 task 始终保持 ``queued``。
+        黑名单由两部分组成：内存 ``SlotTable`` 的 provider lane 满载，以及 DB
+        快照中的 credential pool 满载。后者会 bounded 写入 ``waiting_for_credential``。
         ``provider_id IS NULL`` 老数据和未知 provider 任务不被过滤，claim 后由
         worker 二次 ``_extract_provider`` 派生 provider 再校验容量。
         """
         claimed_any = False
 
         for media_type in ("image", "video", "audio"):
+            find_full_pools = getattr(self.queue, "find_full_credential_pool_providers", None)
+            credential_full = await find_full_pools(media_type) if find_full_pools else set()
+            for provider_id in credential_full:
+                try:
+                    mark_waiting = getattr(self.queue, "mark_waiting_for_credential", None)
+                    if mark_waiting:
+                        await mark_waiting(provider_id, media_type)
+                except Exception:
+                    logger.warning(
+                        "标记等待凭证失败 provider=%s media=%s",
+                        provider_id,
+                        media_type,
+                        exc_info=True,
+                    )
+            credential_full = set(credential_full)
             while True:
-                # 每轮重算池满集合：刚 claim 的任务可能让某 provider 进入满状态
-                pool_full = self._pool_full_providers(media_type)
+                # 每轮重算 lane 满载集合：刚 claim 的任务可能让某 provider 进入满状态。
+                # credential_full 是本 media lane 调度周期的 DB 快照，避免高频 claim N+1。
+                pool_full = self._pool_full_providers(media_type) | credential_full
                 task = await self.queue.claim_next_task(
                     media_type=media_type,
                     pool_full_providers=pool_full,
@@ -562,6 +587,42 @@ class GenerationWorker:
                     # break 当前 media_type 循环：下一轮 SQL 会按重算的 pool_full
                     # 过滤掉这个 provider，避免反复 claim 同一 task
                     break
+
+                if not is_custom_provider(provider_id):
+                    acquire_lease = getattr(self.queue, "acquire_credential_lease", None)
+                    if acquire_lease:
+                        lease = await acquire_lease(
+                            provider=provider_id,
+                            media_type=media_type,
+                            task_id=task["task_id"],
+                            owner_id=self.owner_id,
+                        )
+                        if not lease.acquired and lease.reason != "pool_disabled":
+                            reason = lease.reason or "waiting_for_credential"
+                            logger.info(
+                                "供应商 %s 的 %s 凭证池暂无空闲，task %s 回队等待 (%s)",
+                                provider_id,
+                                media_type,
+                                task["task_id"],
+                                reason,
+                            )
+                            requeue_wait = getattr(self.queue, "requeue_for_credential_wait", None)
+                            if requeue_wait:
+                                await requeue_wait(task["task_id"], reason)
+                            else:
+                                await self._requeue_single_task(task["task_id"])
+                            credential_full.add(provider_id)
+                            continue
+                        if lease.acquired:
+                            task["credential_id"] = lease.credential_id
+                        elif media_type == "video":
+                            bind_active = getattr(self.queue, "bind_active_credential_for_task", None)
+                            if bind_active:
+                                credential_id = await bind_active(
+                                    task_id=task["task_id"],
+                                    provider=provider_id,
+                                )
+                                task["credential_id"] = credential_id
 
                 # Dispatch：登记占用（INFLIGHT），bucket 由 register 自动创建
                 claimed_any = True
@@ -647,6 +708,18 @@ class GenerationWorker:
         await asyncio.gather(*active_tasks, return_exceptions=True)
         self._slots.clear()
 
+    async def _release_credential_lease_safely(self, task_id: str, reason: str) -> None:
+        try:
+            await asyncio.shield(self.queue.release_credential_lease(task_id=task_id, reason=reason))
+        except Exception:
+            logger.warning(
+                "%s task_id=%s reason=%s",
+                encode_failure("credential_lease_release_failed"),
+                task_id,
+                reason,
+                exc_info=True,
+            )
+
     async def _process_task(self, task: dict[str, Any]) -> None:
         """Run a generation task with 0-rows-cancelled finally protocol (ADR 0006).
 
@@ -666,6 +739,7 @@ class GenerationWorker:
         except asyncio.CancelledError:
             # 用户/级联取消：worker.request_cancel 触发 asyncio.Task.cancel()
             await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+            await self._release_credential_lease_safely(task_id, "cancelled")
             raise
         except Exception as exc:
             logger.exception("任务失败 %s (type=%s, provider=%s)", task_id, task_type, provider_id)
@@ -673,6 +747,9 @@ class GenerationWorker:
             if rows == 0:
                 # 外部已抢先翻 cancelling → 落地 cancelled 终态
                 await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+                await self._release_credential_lease_safely(task_id, "cancelled")
+            else:
+                await self._release_credential_lease_safely(task_id, "failed")
             return
 
         try:
@@ -690,16 +767,17 @@ class GenerationWorker:
         if rows == 0:
             # 0-rows-cancelled 协议：execute 跑赢但 DB 已被外部翻 cancelling
             await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+            await self._release_credential_lease_safely(task_id, "cancelled")
         else:
             logger.info("任务完成 %s (type=%s, provider=%s)", task_id, task_type, provider_id)
+            await self._release_credential_lease_safely(task_id, "succeeded")
 
     async def _process_resume_task(self, task: dict[str, Any]) -> None:
         """重启自愈入口：直接调 backend.resume_video，绕过 normal executor 流水线。
 
-        provider 锁定：把持久化的 ``task["provider_id"]`` 注入 payload 的
-        ``video_provider`` 字段，让 ``ConfigResolver`` 按持久化 provider 而非当前
-        项目配置解析 backend。否则任务提交后到重启前若项目 provider 配置切换，
-        会拿旧 ``provider_job_id`` 去新 provider 轮询，导致可恢复任务被误判失败。
+        provider 锁定：优先读取 provider_job_binding，把绑定的 provider/model/credential
+        注入 payload，让 ConfigResolver 和 backend cache 都按 submit 时的凭证构造。
+        找不到 binding 时仅记录稳定 warning code，保留旧任务 active 兼容路径。
         """
         task_id = task["task_id"]
         task_type = task.get("task_type", "unknown")
@@ -712,20 +790,44 @@ class GenerationWorker:
             )
             if rows == 0:
                 await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+                await self._release_credential_lease_safely(task_id, "cancelled")
+            else:
+                await self._release_credential_lease_safely(task_id, "failed")
             return
 
-        # 锁定持久化 provider 到 payload（resolver 优先级：payload > project > 默认）。
-        persisted_provider_id = task.get("provider_id")
-        if persisted_provider_id:
+        binding = await self.queue.get_provider_job_binding_by_task(task_id)
+        if binding is not None:
+            job_id = binding.get("provider_job_id") or job_id
+            provider = binding["provider"]
+            task["provider_id"] = provider
+            task["credential_id"] = binding["credential_id"]
             payload = task.get("payload")
             if payload is None:
                 payload = {}
                 task["payload"] = payload
-            is_video = task.get("media_type") == "video" or task_type in ("video", "reference_video")
-            if is_video:
-                payload["video_provider"] = persisted_provider_id
-            else:
-                payload["image_provider"] = persisted_provider_id
+            payload["video_provider"] = provider
+            model_id = binding.get("model_id")
+            if model_id:
+                payload["video_model"] = model_id
+        else:
+            logger.warning(
+                "%s task_id=%s provider_job_id=%s",
+                encode_failure("credential_binding_missing"),
+                task_id,
+                job_id,
+            )
+            # 旧任务兼容：没有 binding 的历史 job 仍锁定 tasks.provider_id，走 active 凭证。
+            persisted_provider_id = task.get("provider_id")
+            if persisted_provider_id:
+                payload = task.get("payload")
+                if payload is None:
+                    payload = {}
+                    task["payload"] = payload
+                is_video = task.get("media_type") == "video" or task_type in ("video", "reference_video")
+                if is_video:
+                    payload["video_provider"] = persisted_provider_id
+                else:
+                    payload["image_provider"] = persisted_provider_id
 
         provider_id = await _extract_provider(task)
         logger.info(
@@ -743,6 +845,7 @@ class GenerationWorker:
             result = await execute_resume_video_task(task, job_id=job_id)
         except asyncio.CancelledError:
             await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+            await self._release_credential_lease_safely(task_id, "cancelled")
             raise
         except NotImplementedError as exc:
             logger.warning("resume 不支持 task %s: %s", task_id, exc)
@@ -751,6 +854,9 @@ class GenerationWorker:
             )
             if rows == 0:
                 await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+                await self._release_credential_lease_safely(task_id, "cancelled")
+            else:
+                await self._release_credential_lease_safely(task_id, "failed")
             return
         except ResumeExpiredError as exc:
             logger.warning("resume 已过期 task %s: %s", task_id, exc)
@@ -759,23 +865,32 @@ class GenerationWorker:
             )
             if rows == 0:
                 await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+                await self._release_credential_lease_safely(task_id, "cancelled")
+            else:
+                await self._release_credential_lease_safely(task_id, "failed")
             return
         except Exception as exc:
             logger.exception("resume 失败 %s (type=%s, provider=%s)", task_id, task_type, provider_id)
             rows = await asyncio.shield(self.queue.mark_task_failed(task_id, str(exc)))
             if rows == 0:
                 await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+                await self._release_credential_lease_safely(task_id, "cancelled")
+            else:
+                await self._release_credential_lease_safely(task_id, "failed")
             return
 
         try:
             rows = await asyncio.shield(self.queue.mark_task_succeeded(task_id, result))
         except asyncio.CancelledError:
             await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+            await self._release_credential_lease_safely(task_id, "cancelled")
             raise
         if rows == 0:
             await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+            await self._release_credential_lease_safely(task_id, "cancelled")
         else:
             logger.info("重启自愈完成 %s", task_id)
+            await self._release_credential_lease_safely(task_id, "succeeded")
 
     # ------------------------------------------------------------------
     # Cancel & orphan recovery

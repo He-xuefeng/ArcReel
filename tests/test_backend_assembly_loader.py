@@ -40,7 +40,7 @@ class TestLoadBuiltinConfig:
     async def test_credential_overlay_enters_envelope(self, session_factory):
         await _seed_provider_config(session_factory, "ark", api_key="ark-secret", base_url="https://relay.test/api/v3")
         resolver = ConfigResolver(session_factory)
-        config = await _load_builtin_config(resolver, "ark", rate_limiter=None)
+        config = await _load_builtin_config(resolver, "ark", rate_limiter=None, credential_id=None)
         assert config.credentials.get("api_key") == "ark-secret"
         assert config.credentials.get("base_url") == "https://relay.test/api/v3"
         # registry meta 进信封：用于 default_base_url 回退
@@ -50,8 +50,21 @@ class TestLoadBuiltinConfig:
     async def test_rate_limiter_carried_into_envelope(self, session_factory):
         sentinel = object()
         resolver = ConfigResolver(session_factory)
-        config = await _load_builtin_config(resolver, "grok", rate_limiter=sentinel)
+        config = await _load_builtin_config(resolver, "grok", rate_limiter=sentinel, credential_id=None)
         assert config.rate_limiter is sentinel
+
+    async def test_credential_id_selects_specific_credential(self, session_factory):
+        from lib.db.repositories.credential_repository import CredentialRepository
+
+        async with session_factory() as session:
+            repo = CredentialRepository(session)
+            await repo.create("ark", "active", api_key="active-key")
+            selected = await repo.create("ark", "selected", api_key="selected-key")
+            await session.commit()
+
+        resolver = ConfigResolver(session_factory)
+        config = await _load_builtin_config(resolver, "ark", rate_limiter=None, credential_id=selected.id)
+        assert config.credentials["api_key"] == "selected-key"
 
 
 class TestAssembleBuiltinEndToEnd:

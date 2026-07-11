@@ -26,6 +26,7 @@ from lib.config.service import ConfigService, ProviderConfigValueError
 from lib.config.url_utils import normalize_base_url
 from lib.db import get_async_session
 from lib.db.base import dt_to_iso
+from lib.db.repositories.credential_pool_repository import CredentialPoolRepository, CredentialPoolSummary
 from lib.db.repositories.credential_repository import CredentialRepository
 from lib.gemini_shared import VERTEX_SCOPES
 from lib.i18n import Translator
@@ -116,6 +117,11 @@ class CredentialSecretField(BaseModel):
     label: str
 
 
+class CredentialPoolSummaryResponse(BaseModel):
+    enabled_credentials_count: int
+    active_lease_count: int
+
+
 class ProviderConfigResponse(BaseModel):
     id: str
     display_name: str
@@ -132,6 +138,12 @@ class ProviderConfigResponse(BaseModel):
     # （真相源：registry credential_groups；空声明时 router 回退为 [全部 secret_fields]，
     # 与迁移前「全部必填」语义等价）。
     secret_field_groups: list[list[str]]
+    credential_pool_enabled: bool = False
+    credential_pool_concurrency_mode: str = "shared"
+    credential_pool_summary: CredentialPoolSummaryResponse = CredentialPoolSummaryResponse(
+        enabled_credentials_count=0,
+        active_lease_count=0,
+    )
 
 
 class ConnectionTestResponse(BaseModel):
@@ -151,6 +163,8 @@ class CredentialResponse(BaseModel):
     access_key_masked: str | None = None
     secret_key_masked: str | None = None
     is_active: bool
+    is_enabled: bool = False
+    active_lease_count: int = 0
     created_at: str
 
 
@@ -180,6 +194,7 @@ class CreateCredentialRequest(BaseModel):
     base_url: _StrippedOptStr = None
     access_key: _StrippedOptStr = None
     secret_key: _StrippedOptStr = None
+    is_enabled: bool = False
 
 
 class UpdateCredentialRequest(BaseModel):
@@ -188,6 +203,7 @@ class UpdateCredentialRequest(BaseModel):
     base_url: _StrippedOptStr = None
     access_key: _StrippedOptStr = None
     secret_key: _StrippedOptStr = None
+    is_enabled: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +230,7 @@ async def _get_credential_or_404(
     return cred
 
 
-def _cred_to_response(cred: ProviderCredential) -> CredentialResponse:
+def _cred_to_response(cred: ProviderCredential, *, active_lease_count: int = 0) -> CredentialResponse:
     return CredentialResponse(
         id=cred.id,
         provider=cred.provider,
@@ -225,8 +241,42 @@ def _cred_to_response(cred: ProviderCredential) -> CredentialResponse:
         access_key_masked=mask_secret(cred.access_key) if cred.access_key else None,
         secret_key_masked=mask_secret(cred.secret_key) if cred.secret_key else None,
         is_active=cred.is_active,
+        is_enabled=bool(getattr(cred, "is_enabled", False)),
+        active_lease_count=active_lease_count,
         created_at=dt_to_iso(cred.created_at) or "",
     )
+
+
+def _empty_pool_summary() -> CredentialPoolSummary:
+    return CredentialPoolSummary(
+        enabled=False,
+        concurrency_mode="shared",
+        enabled_credentials_count=0,
+        active_lease_count=0,
+    )
+
+
+def _pool_summary_response(summary: CredentialPoolSummary) -> CredentialPoolSummaryResponse:
+    return CredentialPoolSummaryResponse(
+        enabled_credentials_count=summary.enabled_credentials_count,
+        active_lease_count=summary.active_lease_count,
+    )
+
+
+def _structured_error(code: str, message: str) -> dict[str, str]:
+    return {"code": code, "message": message}
+
+
+def _redact_connection_error(message: str, config: dict[str, str]) -> str:
+    redacted = message
+    for key in ("api_key", "access_key", "secret_key"):
+        value = config.get(key)
+        if value:
+            redacted = redacted.replace(value, mask_secret(value))
+    base_url = config.get("base_url")
+    if base_url:
+        redacted = redacted.replace(base_url, "<redacted-base-url>")
+    return redacted[:200] + "..." if len(redacted) > 200 else redacted
 
 
 async def _invalidate_caches(request: Request) -> None:
@@ -318,6 +368,8 @@ async def get_provider_config(
     cred_repo = CredentialRepository(session)
     has_active = await cred_repo.has_active_credential(provider_id)
     status = "ready" if has_active else "unconfigured"
+    pool_repo = CredentialPoolRepository(session)
+    pool_summary = (await pool_repo.list_pool_summaries({provider_id})).get(provider_id, _empty_pool_summary())
 
     # 构建字段列表：先必填，再可选，跳过凭证字段
     fields: list[FieldInfo] = []
@@ -354,6 +406,9 @@ async def get_provider_config(
         supports_base_url="base_url" in meta.optional_keys,
         secret_fields=secret_fields,
         secret_field_groups=secret_field_groups,
+        credential_pool_enabled=pool_summary.enabled,
+        credential_pool_concurrency_mode=pool_summary.concurrency_mode,
+        credential_pool_summary=_pool_summary_response(pool_summary),
     )
 
 
@@ -405,7 +460,11 @@ async def list_credentials(
     _validate_provider(provider_id, _t)
     repo = CredentialRepository(session)
     creds = await repo.list_by_provider(provider_id)
-    return CredentialListResponse(credentials=[_cred_to_response(c) for c in creds])
+    pool_repo = CredentialPoolRepository(session)
+    lease_counts = await pool_repo.active_lease_counts_by_credential({c.id for c in creds})
+    return CredentialListResponse(
+        credentials=[_cred_to_response(c, active_lease_count=lease_counts.get(c.id, 0)) for c in creds]
+    )
 
 
 @router.post("/{provider_id}/credentials", status_code=201, response_model=CredentialResponse)
@@ -425,6 +484,7 @@ async def create_credential(
         base_url=body.base_url,
         access_key=body.access_key,
         secret_key=body.secret_key,
+        is_enabled=body.is_enabled,
     )
     await session.commit()
     await _invalidate_caches(request)
@@ -442,7 +502,7 @@ async def update_credential(
 ) -> Response:
     _validate_provider(provider_id, _t)
     repo = CredentialRepository(session)
-    cred = await _get_credential_or_404(repo, provider_id, cred_id, _t)
+    await _get_credential_or_404(repo, provider_id, cred_id, _t)
     kwargs: dict = {}
     if body.name is not None:
         kwargs["name"] = body.name
@@ -454,11 +514,12 @@ async def update_credential(
         kwargs["access_key"] = body.access_key
     if body.secret_key is not None:
         kwargs["secret_key"] = body.secret_key
+    if body.is_enabled is not None:
+        kwargs["is_enabled"] = body.is_enabled
     if kwargs:
         await repo.update(cred_id, **kwargs)
         await session.commit()
-        if cred.is_active:
-            await _invalidate_caches(request)
+        await _invalidate_caches(request)
     return Response(status_code=204)
 
 
@@ -474,6 +535,12 @@ async def delete_credential(
     repo = CredentialRepository(session)
     cred = await _get_credential_or_404(repo, provider_id, cred_id, _t)
     cred_path = cred.credentials_path  # 在 delete 前保存，避免 ORM 对象过期后无法访问
+    pool_repo = CredentialPoolRepository(session)
+    if await pool_repo.has_active_or_resumable_work(cred_id):
+        raise HTTPException(
+            status_code=409,
+            detail=_structured_error("credential_in_use", _t("task_fail_credential_in_use")),
+        )
     await repo.delete(cred_id)
     await session.commit()
     await _invalidate_caches(request)
@@ -511,6 +578,7 @@ async def upload_vertex_credential(
     request: Request,
     _t: Translator,
     name: str = "Vertex Credentials",
+    is_enabled: bool = False,
     session: AsyncSession = Depends(get_async_session),
     file: UploadFile = File(...),
 ) -> CredentialResponse:
@@ -532,7 +600,7 @@ async def upload_vertex_credential(
         raise HTTPException(status_code=400, detail=_t("vertex_json_missing_project_id"))
 
     repo = CredentialRepository(session)
-    cred = await repo.create(provider="gemini-vertex", name=name)
+    cred = await repo.create(provider="gemini-vertex", name=name, is_enabled=is_enabled)
 
     dest = app_data_dir().parent / "vertex_keys" / f"vertex_cred_{cred.id}.json"
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -837,7 +905,9 @@ async def test_provider_connection(
 
     repo = CredentialRepository(session)
     if credential_id is not None:
-        cred = await _get_credential_or_404(repo, provider_id, credential_id, _t)
+        cred = await repo.get_by_id_for_provider(provider_id, credential_id)
+        if cred is None:
+            raise HTTPException(status_code=404, detail=_t("credentials_not_found"))
     else:
         cred = await repo.get_active(provider_id)
 
@@ -879,9 +949,7 @@ async def test_provider_connection(
             message=_t("connection_timeout"),
         )
     except Exception as exc:
-        err_msg = str(exc)
-        if len(err_msg) > 200:
-            err_msg = err_msg[:200] + "..."
+        err_msg = _redact_connection_error(str(exc), config)
         logger.warning("连接测试失败 [%s]: %s", provider_id, err_msg)
         return ConnectionTestResponse(
             success=False,
